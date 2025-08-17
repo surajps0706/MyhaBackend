@@ -1,18 +1,22 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from models import Product
 from database import db
 from bson import ObjectId
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import razorpay
 import os
 import smtplib
+import io
+import pandas as pd
 from dotenv import load_dotenv
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # Load env vars
 load_dotenv()
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "myha-secret")
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
@@ -39,43 +43,24 @@ def fix_id(doc):
     doc.pop("_id", None)
     return doc
 
+
 # =============================
 # Email Sending Function
 # =============================
 def send_order_email(to_email, order_data):
     try:
         subject = f"Myha Couture - Order Confirmation #{order_data.get('tempOrderId')}"
-        
-        # HTML body
-        items_html = ""
-        for item in order_data.get("items", []):
-            items_html += f"""
-            <li>
-                {item['name']} - ₹{item['price']} 
-                (Qty: {item.get('quantity', 1)})
-            </li>
-            """
 
         html = f"""
-        <h2>Thank you for your order, {order_data['checkoutData']['name']}!</h2>
-        <p>We’ve received your order and will start processing it soon.</p>
-        <h3>Order Details:</h3>
-        <ul>
-            {items_html}
-        </ul>
-        <p><strong>Total Price:</strong> ₹{order_data['totalAmount']}</p>
-
-        <h3>Shipping Address:</h3>
-        <p>
-            {order_data['checkoutData']['addressLine1']}<br>
-            {order_data['checkoutData']['addressLine2']}<br>
-            {order_data['checkoutData']['city']}, {order_data['checkoutData']['state']} - {order_data['checkoutData']['pincode']}<br>
-            Phone: {order_data['checkoutData']['phone']}<br>
-            Email: {order_data['checkoutData']['email']}
-        </p>
-
-        <p>For any queries, contact us at <strong>myha.support@example.com</strong>.</p>
-        <p>~ Team Myha Couture</p>
+        <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
+          <div style="background:#000; padding:20px; text-align:center;">
+            <img src="https://res.cloudinary.com/dw35epojg/image/upload/v1754020493/logo_v5px6x.jpg" alt="Myha Logo" style="max-height:50px;" />
+          </div>
+          <div style="padding:20px;">
+            <h2 style="color:#000;">Thank you for shopping with <span style="color:#d63384;">Myha Couture</span>, {order_data['checkoutData']['name']}!</h2>
+            <p>Your order <b>#{order_data.get('tempOrderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>
+          </div>
+        </div>
         """
 
         msg = MIMEMultipart()
@@ -93,6 +78,7 @@ def send_order_email(to_email, order_data):
     except Exception as e:
         print(f"❌ Failed to send email: {e}")
 
+
 # =============================
 # Product APIs
 # =============================
@@ -105,7 +91,6 @@ async def get_products():
             products.append(fix_id(product))
         return products
     except Exception as e:
-        print("❌ ERROR:", e)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/product/{product_id}")
@@ -116,7 +101,6 @@ async def get_product(product_id: str):
             raise HTTPException(status_code=404, detail="Product not found")
         return fix_id(product)
     except Exception as e:
-        print("❌ ERROR:", e)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/add-product")
@@ -125,8 +109,8 @@ async def add_product(product: Product):
         result = await db["products"].insert_one(product.dict())
         return {"message": "Product added", "id": str(result.inserted_id)}
     except Exception as e:
-        print("❌ ERROR:", e)
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 # =============================
 # Razorpay Order Creation
@@ -144,15 +128,15 @@ async def create_order(request: Request):
 
     try:
         razorpay_order = razorpay_client.order.create({
-            "amount": amount * 100,  # convert rupees to paise
+            "amount": amount * 100,
             "currency": currency,
             "receipt": receipt,
             "notes": notes
         })
         return razorpay_order
     except Exception as e:
-        print("❌ Razorpay order creation error:", e)
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 # =============================
 # Save Order & Send Email
@@ -162,13 +146,94 @@ async def save_order(request: Request):
     data = await request.json()
     try:
         result = await db["orders"].insert_one(data)
-
-        # Send email to customer
         customer_email = data.get("checkoutData", {}).get("email")
         if customer_email:
             send_order_email(customer_email, data)
-
         return {"message": "Order saved", "id": str(result.inserted_id)}
     except Exception as e:
-        print("❌ ERROR saving order:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================
+# Admin: View Orders
+# =============================
+@app.get("/orders")
+async def get_orders(authorization: str = Header(None)):
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    orders_cursor = db["orders"].find().sort("createdAt", -1)
+    orders = []
+    async for order in orders_cursor:
+        orders.append(fix_id(order))
+    return orders
+
+
+# =============================
+# Admin: Update Status
+# =============================
+@app.put("/orders/{order_id}/status")
+async def update_order_status(order_id: str, request: Request, authorization: str = Header(None)):
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    data = await request.json()
+    new_status = data.get("status")
+
+    if new_status not in ["Pending Delivery", "Processing", "Shipped", "Delivered"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    result = await db["orders"].update_one(
+        {"_id": ObjectId(order_id)},
+        {"$set": {"status": new_status}}
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return {"message": "Status updated successfully"}
+
+# =============================
+# Admin: Export Orders to Excel
+# =============================
+@app.get("/orders/export")
+async def export_orders(authorization: str = Header(None)):
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    orders_cursor = db["orders"].find().sort("createdAt", -1)
+    orders = []
+    async for order in orders_cursor:
+        created_at = order.get("createdAt")
+
+        # ✅ Handle datetime or string or None
+        if hasattr(created_at, "isoformat"):  
+            created_at = created_at.isoformat()
+        elif created_at is None:
+            created_at = ""
+        else:
+            created_at = str(created_at)
+
+        orders.append({
+            "Order ID": str(order["_id"]),
+            "Customer": order.get("checkoutData", {}).get("name"),
+            "Email": order.get("checkoutData", {}).get("email"),
+            "Phone": order.get("checkoutData", {}).get("phone"),
+            "Total Amount": order.get("totalAmount"),
+            "Status": order.get("status"),
+            "Created At": created_at
+        })
+
+    df = pd.DataFrame(orders)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Orders")
+    output.seek(0)
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=orders.xlsx"}
+    )
+
