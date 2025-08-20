@@ -12,6 +12,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+import random
 
 # Load env vars
 load_dotenv()
@@ -45,11 +47,19 @@ def fix_id(doc):
 
 
 # =============================
+# Utility: Generate Professional Order ID
+# =============================
+def generate_order_id():
+    now = datetime.utcnow()
+    return f"MYHA{now.strftime('%Y%m%d%H%M%S')}{random.randint(100,999)}"
+
+
+# =============================
 # Email Sending Function
 # =============================
 def send_order_email(to_email, order_data):
     try:
-        subject = f"Myha Couture - Order Confirmation #{order_data.get('tempOrderId')}"
+        subject = f"Myha Couture - Order Confirmation #{order_data.get('orderId')}"
 
         html = f"""
         <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
@@ -58,7 +68,7 @@ def send_order_email(to_email, order_data):
           </div>
           <div style="padding:20px;">
             <h2 style="color:#000;">Thank you for shopping with <span style="color:#d63384;">Myha Couture</span>, {order_data['checkoutData']['name']}!</h2>
-            <p>Your order <b>#{order_data.get('tempOrderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>
+            <p>Your order <b>#{order_data.get('orderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>
           </div>
         </div>
         """
@@ -106,7 +116,9 @@ async def get_product(product_id: str):
 @app.post("/add-product")
 async def add_product(product: Product):
     try:
-        result = await db["products"].insert_one(product.dict())
+        product_data = product.dict()
+        product_data["createdAt"] = datetime.utcnow()
+        result = await db["products"].insert_one(product_data)
         return {"message": "Product added", "id": str(result.inserted_id)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -141,18 +153,30 @@ async def create_order(request: Request):
 # =============================
 # Save Order & Send Email
 # =============================
+
 @app.post("/save-order")
 async def save_order(request: Request):
     data = await request.json()
     try:
+        # ✅ Generate MYHA-style Order ID
+        myha_order_id = f"MYHA{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+        data["orderId"] = myha_order_id   # ✅ use this everywhere
+        data["razorpayOrderId"] = data.get("orderId")  # store Razorpay orderId separately
+        data["status"] = "Pending Delivery"
+        data["createdAt"] = datetime.utcnow()
+
+        # Save to Mongo
         result = await db["orders"].insert_one(data)
+
+        # Send email with MYHA ID
         customer_email = data.get("checkoutData", {}).get("email")
         if customer_email:
             send_order_email(customer_email, data)
-        return {"message": "Order saved", "id": str(result.inserted_id)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
+        return {"message": "Order saved", "id": str(result.inserted_id), "orderId": myha_order_id}
+    except Exception as e:
+        print("❌ ERROR saving order:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =============================
 # Admin: View Orders
@@ -193,6 +217,7 @@ async def update_order_status(order_id: str, request: Request, authorization: st
 
     return {"message": "Status updated successfully"}
 
+
 # =============================
 # Admin: Export Orders to Excel
 # =============================
@@ -206,8 +231,7 @@ async def export_orders(authorization: str = Header(None)):
     async for order in orders_cursor:
         created_at = order.get("createdAt")
 
-        # ✅ Handle datetime or string or None
-        if hasattr(created_at, "isoformat"):  
+        if hasattr(created_at, "isoformat"):
             created_at = created_at.isoformat()
         elif created_at is None:
             created_at = ""
@@ -215,7 +239,7 @@ async def export_orders(authorization: str = Header(None)):
             created_at = str(created_at)
 
         orders.append({
-            "Order ID": str(order["_id"]),
+            "Order ID": order.get("orderId"),
             "Customer": order.get("checkoutData", {}).get("name"),
             "Email": order.get("checkoutData", {}).get("email"),
             "Phone": order.get("checkoutData", {}).get("phone"),
@@ -236,4 +260,88 @@ async def export_orders(authorization: str = Header(None)):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=orders.xlsx"}
     )
+
+
+# =============================
+# Admin Login
+# =============================
+@app.post("/admin/login")
+async def admin_login(request: Request):
+    data = await request.json()
+    username = data.get("username")
+    password = data.get("password")
+
+    if username == os.getenv("ADMIN_USER", "admin") and password == os.getenv("ADMIN_PASSWORD", "super-secret"):
+        return {"token": os.getenv("ADMIN_TOKEN", "myha-secret")}
+    
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+# =============================
+# Admin: Delete Product
+# =============================
+@app.delete("/products/{product_id}")
+async def delete_product(product_id: str, authorization: str = Header(None)):
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    result = await db["products"].delete_one({"_id": ObjectId(product_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"message": "Product deleted"}
+
+
+# =============================
+# Admin: Update Product
+# =============================
+@app.put("/products/{product_id}")
+async def update_product(product_id: str, request: Request, authorization: str = Header(None)):
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    data = await request.json()
+    result = await db["products"].update_one(
+        {"_id": ObjectId(product_id)},
+        {"$set": data}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"message": "Product updated"}
+
+
+# =============================
+# Get Single Order by ID (Admin)
+# =============================
+@app.get("/orders/{order_id}")
+async def get_order(order_id: str):
+    try:
+        order = await db["orders"].find_one({"_id": ObjectId(order_id)})
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        return fix_id(order)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================
+# Track Order (Customer Facing)
+# =============================
+@app.post("/track-order")
+async def track_order(request: Request):
+    data = await request.json()
+    order_id = data.get("orderId")
+    email = data.get("email")
+
+    if not order_id or not email:
+        raise HTTPException(status_code=400, detail="Order ID and email required")
+
+    try:
+        order = await db["orders"].find_one({
+            "orderId": order_id,   # ✅ match MYHA Order ID
+            "checkoutData.email": email
+        })
+        if not order:
+            raise HTTPException(status_code=404, detail="No order found with provided details")
+        return fix_id(order)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
