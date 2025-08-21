@@ -465,3 +465,6 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/")
+def home():
+    return {"message": "Welcome to Myha Backend 🚀"}
