@@ -49,6 +49,10 @@ cloudinary.config(
 
 app = FastAPI()
 
+@app.get("/")
+def root():
+    return {"message": "Welcome to Myha Backend 🚀"}
+
 
 app.add_middleware(
     CORSMiddleware,
