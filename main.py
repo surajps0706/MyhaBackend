@@ -56,11 +56,17 @@ def root():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200"],  # Angular dev server
+    allow_origins=[
+        "http://localhost:4200",                     # Angular local dev
+        "https://taupe-cannoli-010c45.netlify.app",  # Netlify deploy URL
+        "https://myhacouture.com",                   # Your GoDaddy domain
+        "https://www.myhacouture.com"                # with www just in case
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 def fix_id(doc):
     doc["id"] = str(doc["_id"])
