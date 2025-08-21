@@ -4,6 +4,8 @@ from database import db
 from bson import ObjectId
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import razorpay
 import os
 import smtplib
@@ -46,6 +48,7 @@ cloudinary.config(
 )
 
 app = FastAPI()
+
 
 app.add_middleware(
     CORSMiddleware,
