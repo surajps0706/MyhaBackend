@@ -4,3 +4,7 @@ motor
 pydantic
 python-dotenv
 razorpay
+cloudinary
+pandas
+openpyxl
+setuptools
