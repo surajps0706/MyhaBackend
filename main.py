@@ -145,7 +145,7 @@ def send_order_email(to_email, order_data):
         """
 
         msg = MIMEMultipart()
-        msg["From"] = EMAIL_USER
+        msg["From"] = f"Myha Couture <{EMAIL_USER}>"
         msg["To"] = to_email
         msg["Subject"] = subject
         msg.attach(MIMEText(html, "html"))
