@@ -73,7 +73,7 @@ def fix_id(doc):
     doc.pop("_id", None)
     return doc
 
-    
+
 
 
 # =============================
@@ -108,9 +108,10 @@ def send_order_email(to_email, order_data):
             """
             for item in cart_items:
                 name = item.get("name", "N/A")
-                price = item.get("price", 0)
-                qty = item.get("quantity", 1)
-                total = price * qty
+             price = float(item.get("price", 0) or 0)
+            qty = int(item.get("quantity", 1) or 1)
+            total = price * qty
+
                 items_html += f"""
                 <tr>
                   <td style="border:1px solid #ddd; padding:10px;">{name}</td>
@@ -121,7 +122,7 @@ def send_order_email(to_email, order_data):
                 """
             items_html += "</tbody></table>"
 
-        total_amount = order_data.get("totalAmount", 0)
+total_amount = float(order_data.get("totalAmount", 0) or 0)
         customer_name = order_data["checkoutData"]["name"]
         customer_email = order_data["checkoutData"]["email"]
         customer_phone = order_data["checkoutData"]["phone"]
@@ -147,9 +148,9 @@ def send_order_email(to_email, order_data):
             <!-- Order Summary -->
             {items_html}
 
-            <p style="margin-top:20px; font-size:16px; text-align:right;">
-              <b style="font-size:18px;">Grand Total: ₹{total_amount}</b>
-            </p>
+           <p style="margin-top:20px; font-size:16px; text-align:right;">
+  <b style="font-size:18px;">Grand Total: ₹{total_amount:.2f}</b>
+</p>
 
             <!-- Customer Info -->
             <div style="margin-top:30px;">
