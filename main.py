@@ -108,20 +108,20 @@ def send_order_email(to_email, order_data):
             """
             for item in cart_items:
                 name = item.get("name", "N/A")
-                price = item.get("price", 0)
-                qty = item.get("quantity", 1)
+                price = float(item.get("price", 0))   # force numeric
+                qty = int(item.get("quantity", 1))    # force integer
                 total = price * qty
                 items_html += f"""
                 <tr>
                   <td style="border:1px solid #ddd; padding:8px;">{name}</td>
-                  <td style="border:1px solid #ddd; padding:8px; text-align:right;">₹{price}</td>
+                  <td style="border:1px solid #ddd; padding:8px; text-align:right;">₹{price:.2f}</td>
                   <td style="border:1px solid #ddd; padding:8px; text-align:right;">{qty}</td>
-                  <td style="border:1px solid #ddd; padding:8px; text-align:right;">₹{total}</td>
+                  <td style="border:1px solid #ddd; padding:8px; text-align:right;">₹{total:.2f}</td>
                 </tr>
                 """
             items_html += "</tbody></table>"
 
-        total_amount = order_data.get("totalAmount", 0)
+        total_amount = float(order_data.get("totalAmount", 0))
 
         html = f"""
         <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
