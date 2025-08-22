@@ -112,9 +112,6 @@ def send_order_email(to_email, order_data):
                 price = float(raw_price.replace("₹", "").replace(",", "").strip())
                 qty = int(item.get("quantity", 1) or 1)
                 total = price * qty
-                price = float(item.get("price", 0) or 0)
-                qty = int(item.get("quantity", 1) or 1)
-                total = price * qty
 
                 items_html += f"""
                 <tr>
