@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi import FastAPI, UploadFile, File, Form
 import razorpay
 import os
 import smtplib
@@ -42,9 +43,10 @@ CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 cloudinary.config(
-    cloud_name=CLOUDINARY_CLOUD_NAME,
-    api_key=CLOUDINARY_API_KEY,
-    api_secret=CLOUDINARY_API_SECRET
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
 )
 
 app = FastAPI()
@@ -478,3 +480,52 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
 @app.get("/")
 def home():
     return {"message": "Welcome to Myha Backend 🚀"}
+
+
+# =============================
+# Reviews API
+# =============================
+
+@app.get("/products/{product_id}/reviews")
+async def get_reviews(product_id: str):
+    try:
+        reviews_cursor = db["reviews"].find({"productId": product_id}).sort("createdAt", -1)
+        reviews = []
+        async for review in reviews_cursor:
+            reviews.append(fix_id(review))
+        return reviews
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/products/{product_id}/reviews")
+async def add_review(
+    product_id: str,
+    name: str = Form(...),
+    rating: int = Form(...),
+    comment: str = Form(...),
+    image: UploadFile = File(None)
+):
+    try:
+        image_url = None
+        if image:
+            # Read file into memory
+            contents = await image.read()
+            upload_result = cloudinary.uploader.upload(contents, folder="reviews")
+            image_url = upload_result.get("secure_url")
+
+        review = {
+            "productId": product_id,
+            "name": name,
+            "rating": int(rating),
+            "comment": comment,
+            "imageUrl": image_url,
+            "createdAt": datetime.utcnow()
+        }
+
+        result = await db["reviews"].insert_one(review)
+        review["_id"] = str(result.inserted_id)
+        return review
+    except Exception as e:
+        print("Review error:", e)  # 👈 log error
+        raise HTTPException(status_code=500, detail=str(e))
