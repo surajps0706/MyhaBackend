@@ -59,10 +59,10 @@ def root():
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:4200",                     # Angular local dev
-        "https://taupe-cannoli-010c45.netlify.app",  # Netlify deploy URL
-        "https://myhacouture.com",                   # Your GoDaddy domain
-        "https://www.myhacouture.com"                # with www just in case
+        "http://localhost:4200",
+        "https://taupe-cannoli-010c45.netlify.app",
+        "https://myhacouture.com",
+        "https://www.myhacouture.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -108,8 +108,12 @@ def send_order_email(to_email, order_data):
             """
             for item in cart_items:
                 name = item.get("name", "N/A")
-                price = float(item.get("price", 0))   # force numeric
-                qty = int(item.get("quantity", 1))    # force integer
+                price = item.get("price", 0)
+                if isinstance(price, str):
+                    price = price.replace("₹", "").replace(",", "").strip()
+                price = float(price)
+
+                qty = int(item.get("quantity", 1))
                 total = price * qty
                 items_html += f"""
                 <tr>
@@ -121,7 +125,10 @@ def send_order_email(to_email, order_data):
                 """
             items_html += "</tbody></table>"
 
-        total_amount = float(order_data.get("totalAmount", 0))
+        total_amount = order_data.get("totalAmount", 0)
+        if isinstance(total_amount, str):
+            total_amount = total_amount.replace("₹", "").replace(",", "").strip()
+        total_amount = float(total_amount)
 
         html = f"""
         <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
@@ -132,7 +139,7 @@ def send_order_email(to_email, order_data):
             <h2 style="color:#000;">Thank you for shopping with <span style="color:#d63384;">Myha Couture</span>, {order_data['checkoutData']['name']}!</h2>
             <p>Your order <b>#{order_data.get('orderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>
             {items_html}
-            <p style="margin-top:20px; font-size:16px;"><b>Grand Total: {total_amount}</b></p>
+            <p style="margin-top:20px; font-size:16px;"><b>Grand Total: ₹{total_amount:.2f}</b></p>
           </div>
         </div>
         """
@@ -187,7 +194,6 @@ async def add_product(product: Product):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# 👉 New endpoint with images (Cloudinary upload)
 @app.post("/upload-product")
 async def upload_product(
     name: str = Form(...),
@@ -221,7 +227,6 @@ async def upload_product(
         }
 
         result = await db["products"].insert_one(product_data)
-
         return {"message": "✅ Product uploaded", "id": str(result.inserted_id), "product": product_data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -464,8 +469,6 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
         }
 
         result = await db["products"].insert_one(product_data)
-
-        # fetch fresh doc and clean ObjectId
         saved_product = await db["products"].find_one({"_id": result.inserted_id})
         saved_product = fix_id(saved_product)
 
@@ -477,6 +480,7 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/")
 def home():
     return {"message": "Welcome to Myha Backend 🚀"}
@@ -485,7 +489,6 @@ def home():
 # =============================
 # Reviews API
 # =============================
-
 @app.get("/products/{product_id}/reviews")
 async def get_reviews(product_id: str):
     try:
@@ -509,23 +512,20 @@ async def add_review(
     try:
         image_url = None
         if image:
-            # Read file into memory
             contents = await image.read()
             upload_result = cloudinary.uploader.upload(contents, folder="reviews")
-            image_url = upload_result.get("secure_url")
+            image_url = upload_result["secure_url"]
 
-        review = {
+        review_data = {
             "productId": product_id,
             "name": name,
-            "rating": int(rating),
+            "rating": rating,
             "comment": comment,
-            "imageUrl": image_url,
+            "image": image_url,
             "createdAt": datetime.utcnow()
         }
 
-        result = await db["reviews"].insert_one(review)
-        review["_id"] = str(result.inserted_id)
-        return review
+        result = await db["reviews"].insert_one(review_data)
+        return {"message": "✅ Review added", "id": str(result.inserted_id), "review": review_data}
     except Exception as e:
-        print("Review error:", e)  # 👈 log error
         raise HTTPException(status_code=500, detail=str(e))
