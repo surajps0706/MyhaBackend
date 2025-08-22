@@ -124,10 +124,12 @@ def send_order_email(to_email, order_data):
             items_html += "</tbody></table>"
 
         total_amount = float(order_data.get("totalAmount", 0) or 0)
-        customer_name = order_data["checkoutData"]["name"]
-        customer_email = order_data["checkoutData"]["email"]
-        customer_phone = order_data["checkoutData"]["phone"]
-        customer_address = order_data["checkoutData"]["address"]
+        checkout = order_data.get("checkoutData", {})
+        customer_name = checkout.get("name", "N/A")
+        customer_email = checkout.get("email", "N/A")
+        customer_phone = checkout.get("phone", "N/A")
+        customer_address = checkout.get("address", "N/A")
+
 
         html = f"""
         <div style="font-family: Arial, sans-serif; color:#333; max-width:600px; margin:auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
