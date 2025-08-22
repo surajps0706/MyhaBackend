@@ -108,6 +108,10 @@ def send_order_email(to_email, order_data):
             """
             for item in cart_items:
                 name = item.get("name", "N/A")
+                raw_price = str(item.get("price", 0) or 0)
+                price = float(raw_price.replace("₹", "").replace(",", "").strip())
+                qty = int(item.get("quantity", 1) or 1)
+                total = price * qty
                 price = float(item.get("price", 0) or 0)
                 qty = int(item.get("quantity", 1) or 1)
                 total = price * qty
@@ -515,6 +519,6 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/")
-def home():
-    return {"message": "Welcome to Myha Backend 🚀"}
+# @app.get("/")
+# def home():
+#     return {"message": "Welcome to Myha Backend 🚀"}
