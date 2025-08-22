@@ -14,3 +14,4 @@ class Product(BaseModel):
 
 # uvicorn main:app --reload
 # .\env\Scripts\activate
+# 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

@@ -130,7 +130,7 @@ def send_order_email(to_email, order_data):
             <h2 style="color:#000;">Thank you for shopping with <span style="color:#d63384;">Myha Couture</span>, {order_data['checkoutData']['name']}!</h2>
             <p>Your order <b>#{order_data.get('orderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>
             {items_html}
-            <p style="margin-top:20px; font-size:16px;"><b>Grand Total: ₹{total_amount}</b></p>
+            <p style="margin-top:20px; font-size:16px;"><b>Grand Total: {total_amount}</b></p>
           </div>
         </div>
         """
