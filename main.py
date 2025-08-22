@@ -74,8 +74,6 @@ def fix_id(doc):
     return doc
 
 
-
-
 # =============================
 # Utility: Generate Professional Order ID
 # =============================
@@ -84,96 +82,55 @@ def generate_order_id():
     return f"MYHA{now.strftime('%Y%m%d%H%M%S')}{random.randint(100,999)}"
 
 
-#==========================
-# send email 
-
+# =============================
+# Send Email (Order Confirmation)
+# =============================
 def send_order_email(to_email, order_data):
     try:
-        subject = f"🧾 Myha Couture - Order Confirmation #{order_data.get('orderId')}"
+        subject = f"Myha Couture - Order Confirmation #{order_data.get('orderId')}"
         cart_items = order_data.get("cartItems", [])
         items_html = ""
 
         if cart_items:
             items_html += """
-            <table style="width:100%; border-collapse:collapse; margin-top:20px; font-size:14px;">
+            <table style="width:100%; border-collapse:collapse; margin-top:20px;">
               <thead>
-                <tr style="background:#f5f5f5; color:#333;">
-                  <th style="border:1px solid #ddd; padding:10px; text-align:left;">Product</th>
-                  <th style="border:1px solid #ddd; padding:10px; text-align:right;">Price</th>
-                  <th style="border:1px solid #ddd; padding:10px; text-align:right;">Qty</th>
-                  <th style="border:1px solid #ddd; padding:10px; text-align:right;">Total</th>
+                <tr style="background:#f5f5f5;">
+                  <th style="border:1px solid #ddd; padding:8px; text-align:left;">Product</th>
+                  <th style="border:1px solid #ddd; padding:8px; text-align:right;">Price</th>
+                  <th style="border:1px solid #ddd; padding:8px; text-align:right;">Qty</th>
+                  <th style="border:1px solid #ddd; padding:8px; text-align:right;">Total</th>
                 </tr>
               </thead>
               <tbody>
             """
             for item in cart_items:
                 name = item.get("name", "N/A")
-                raw_price = str(item.get("price", 0) or 0)
-                price = float(raw_price.replace("₹", "").replace(",", "").strip())
-                qty = int(item.get("quantity", 1) or 1)
+                price = item.get("price", 0)
+                qty = item.get("quantity", 1)
                 total = price * qty
-
                 items_html += f"""
                 <tr>
-                  <td style="border:1px solid #ddd; padding:10px;">{name}</td>
-                  <td style="border:1px solid #ddd; padding:10px; text-align:right;">₹{price:.2f}</td>
-                  <td style="border:1px solid #ddd; padding:10px; text-align:right;">{qty}</td>
-                  <td style="border:1px solid #ddd; padding:10px; text-align:right;">₹{total:.2f}</td>
+                  <td style="border:1px solid #ddd; padding:8px;">{name}</td>
+                  <td style="border:1px solid #ddd; padding:8px; text-align:right;">₹{price}</td>
+                  <td style="border:1px solid #ddd; padding:8px; text-align:right;">{qty}</td>
+                  <td style="border:1px solid #ddd; padding:8px; text-align:right;">₹{total}</td>
                 </tr>
                 """
             items_html += "</tbody></table>"
 
-        total_amount = float(order_data.get("totalAmount", 0) or 0)
-        checkout = order_data.get("checkoutData", {})
-        customer_name = checkout.get("name", "N/A")
-        customer_email = checkout.get("email", "N/A")
-        customer_phone = checkout.get("phone", "N/A")
-        customer_address = checkout.get("address", "N/A")
-
+        total_amount = order_data.get("totalAmount", 0)
 
         html = f"""
-        <div style="font-family: Arial, sans-serif; color:#333; max-width:600px; margin:auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
-          
-          <!-- Header -->
+        <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
           <div style="background:#000; padding:20px; text-align:center;">
             <img src="https://res.cloudinary.com/dw35epojg/image/upload/v1754020493/logo_v5px6x.jpg" alt="Myha Logo" style="max-height:50px;" />
           </div>
-
-          <!-- Body -->
           <div style="padding:20px;">
-            <h2 style="color:#000; margin-bottom:8px;">Order Confirmation</h2>
-            <p style="font-size:15px; line-height:1.6;">
-              Hi <b>{customer_name}</b>,<br>
-              Thank you for shopping with <b style="color:#d63384;">Myha Couture</b>.<br>
-              Your order <b>#{order_data.get('orderId')}</b> has been placed successfully. 🎉
-            </p>
-
-            <!-- Order Summary -->
+            <h2 style="color:#000;">Thank you for shopping with <span style="color:#d63384;">Myha Couture</span>, {order_data['checkoutData']['name']}!</h2>
+            <p>Your order <b>#{order_data.get('orderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>
             {items_html}
-
-            <p style="margin-top:20px; font-size:16px; text-align:right; background:#f9f9f9; padding:10px; border-radius:5px;">
-              <b style="font-size:18px; color:#000;">Grand Total: ₹{total_amount:.2f}</b>
-            </p>
-
-            <!-- Customer Info -->
-            <div style="margin-top:30px;">
-              <h3 style="margin-bottom:8px; font-size:16px; color:#000;">Customer & Shipping Details</h3>
-              <p style="margin:0; font-size:14px;"><b>Name:</b> {customer_name}</p>
-              <p style="margin:0; font-size:14px;"><b>Email:</b> {customer_email}</p>
-              <p style="margin:0; font-size:14px;"><b>Phone:</b> {customer_phone}</p>
-              <p style="margin:0; font-size:14px;"><b>Address:</b> {customer_address}</p>
-            </div>
-
-            <p style="margin-top:30px; font-size:14px; color:#666;">
-              You’ll receive another update once your order has been shipped.<br>
-              For any questions, feel free to reply to this email or contact us on WhatsApp.
-            </p>
-          </div>
-
-          <!-- Footer -->
-          <div style="background:#f5f5f5; padding:15px; text-align:center; font-size:13px; color:#777;">
-            © {datetime.now().year} Myha Couture • All Rights Reserved<br>
-            <a href="https://myha.in" style="color:#d63384; text-decoration:none;">Visit our store</a>
+            <p style="margin-top:20px; font-size:16px;"><b>Grand Total: {total_amount}</b></p>
           </div>
         </div>
         """
@@ -518,6 +475,6 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# @app.get("/")
-# def home():
-#     return {"message": "Welcome to Myha Backend 🚀"}
+@app.get("/")
+def home():
+    return {"message": "Welcome to Myha Backend 🚀"}
