@@ -269,8 +269,11 @@ async def save_order(request: Request):
         myha_order_id = f"MYHA{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
         data["orderId"] = myha_order_id
         data["razorpayOrderId"] = data.get("orderId")
-        data["status"] = "Pending Delivery"
+        data["status"] = "Pending Delivery"  # ✅ Default standardized
         data["createdAt"] = datetime.utcnow()
+        data["statusTimeline"] = {
+             "Pending Delivery": datetime.utcnow().isoformat()
+        }
 
         result = await db["orders"].insert_one(data)
 
@@ -295,7 +298,9 @@ async def get_orders(authorization: str = Header(None)):
     orders_cursor = db["orders"].find().sort("createdAt", -1)
     orders = []
     async for order in orders_cursor:
-        orders.append(fix_id(order))
+        order = fix_id(order)
+        order["orderId"] = order.get("orderId")  # ✅ ensure included
+        orders.append(order)
     return orders
 
 
@@ -310,19 +315,33 @@ async def update_order_status(order_id: str, request: Request, authorization: st
     data = await request.json()
     new_status = data.get("status")
 
-    if new_status not in ["Pending Delivery", "Processing", "Shipped", "Delivered"]:
+    valid_statuses = ["Pending Delivery", "Processing", "Shipped", "Delivered"]
+    if new_status not in valid_statuses:
         raise HTTPException(status_code=400, detail="Invalid status")
 
+    # ✅ Fetch the order first
+    order = await db["orders"].find_one({"orderId": order_id})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # ✅ Update statusTimeline safely
+    status_timeline = order.get("statusTimeline", {})
+    status_timeline[new_status] = datetime.utcnow().isoformat()
+
     result = await db["orders"].update_one(
-        {"_id": ObjectId(order_id)},
-        {"$set": {"status": new_status}}
+        {"orderId": order_id},
+        {"$set": {"status": new_status, "statusTimeline": status_timeline}}
     )
 
     if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Order not found")
+        raise HTTPException(status_code=500, detail="Failed to update status")
 
-    return {"message": "Status updated successfully"}
-
+    return {
+        "message": "Status updated successfully",
+        "orderId": order_id,
+        "status": new_status,
+        "statusTimeline": status_timeline
+    }
 
 # =============================
 # Admin: Export Orders
@@ -417,7 +436,7 @@ async def update_product(product_id: str, request: Request, authorization: str =
 @app.get("/orders/{order_id}")
 async def get_order(order_id: str):
     try:
-        order = await db["orders"].find_one({"_id": ObjectId(order_id)})
+        order = await db["orders"].find_one({"orderId": order_id})  # ✅ FIXED: match by orderId
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
         return fix_id(order)
@@ -496,10 +515,10 @@ async def get_reviews(product_id: str):
         reviews_cursor = db["reviews"].find({"productId": product_id}).sort("createdAt", -1)
         reviews = []
         async for review in reviews_cursor:
-            reviews.append(fix_id(review))
+                reviews.append(fix_id(review))
         return reviews
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/products/{product_id}/reviews")
