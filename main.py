@@ -33,8 +33,9 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 
 EMAIL_HOST = os.getenv("EMAIL_HOST")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
+EMAIL_USER = os.getenv("EMAIL_USER")     # Brevo login (example: 956372001@smtp-brevo.com)
+EMAIL_PASS = os.getenv("EMAIL_PASS")     # Brevo SMTP key
+EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_USER)  # Branded From address (example: order@myhacouture.com)
 
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
@@ -145,7 +146,7 @@ def send_order_email(to_email, order_data):
         """
 
         msg = MIMEMultipart()
-        msg["From"] = f"Myha Couture <{EMAIL_USER}>"
+        msg["From"] = f"Myha Couture <{EMAIL_FROM}>"
         msg["To"] = to_email
         msg["Subject"] = subject
         msg.attach(MIMEText(html, "html"))
@@ -153,7 +154,7 @@ def send_order_email(to_email, order_data):
         with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
             server.starttls()
             server.login(EMAIL_USER, EMAIL_PASS)
-            server.sendmail(EMAIL_USER, to_email, msg.as_string())
+            server.sendmail(EMAIL_FROM, to_email, msg.as_string())
 
         print(f"✅ Order email sent to {to_email}")
     except Exception as e:
