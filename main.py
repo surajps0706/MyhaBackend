@@ -15,7 +15,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+from datetime import datetime, timezone
 import random
 from typing import List
 import cloudinary
@@ -189,7 +189,7 @@ async def get_product(product_id: str):
 async def add_product(product: Product):
     try:
         product_data = product.dict()
-        product_data["createdAt"] = datetime.utcnow()
+        product_data["createdAt"] = datetime.now().strftime("%Y-%m-%d")
         result = await db["products"].insert_one(product_data)
         return {"message": "Product added", "id": str(result.inserted_id)}
     except Exception as e:
@@ -224,7 +224,7 @@ async def upload_product(
             "sizes": sizes,
             "colors": colors,
             "images": image_urls,
-            "createdAt": datetime.utcnow()
+            "createdAt": datetime.now().strftime("%Y-%m-%d")
         }
 
         result = await db["products"].insert_one(product_data)
@@ -266,13 +266,13 @@ async def create_order(request: Request):
 async def save_order(request: Request):
     data = await request.json()
     try:
-        myha_order_id = f"MYHA{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+        myha_order_id = f"MYHA{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         data["orderId"] = myha_order_id
         data["razorpayOrderId"] = data.get("orderId")
         data["status"] = "Pending Delivery"  # ✅ Default standardized
-        data["createdAt"] = datetime.utcnow()
+        data["createdAt"] = datetime.now().strftime("%Y-%m-%d")
         data["statusTimeline"] = {
-             "Pending Delivery": datetime.utcnow().isoformat()
+             "Pending Delivery": datetime.now().strftime("%Y-%m-%d")
         }
 
         result = await db["orders"].insert_one(data)
@@ -326,7 +326,7 @@ async def update_order_status(order_id: str, request: Request, authorization: st
 
     # ✅ Update statusTimeline safely
     status_timeline = order.get("statusTimeline", {})
-    status_timeline[new_status] = datetime.utcnow().isoformat()
+    status_timeline[new_status] = datetime.now().strftime("%Y-%m-%d")
 
     result = await db["orders"].update_one(
         {"orderId": order_id},
@@ -354,14 +354,7 @@ async def export_orders(authorization: str = Header(None)):
     orders_cursor = db["orders"].find().sort("createdAt", -1)
     orders = []
     async for order in orders_cursor:
-        created_at = order.get("createdAt")
-        if hasattr(created_at, "isoformat"):
-            created_at = created_at.isoformat()
-        elif created_at is None:
-            created_at = ""
-        else:
-            created_at = str(created_at)
-
+        created_at = str(order.get("createdAt", ""))
         orders.append({
             "Order ID": order.get("orderId"),
             "Customer": order.get("checkoutData", {}).get("name"),
@@ -485,7 +478,7 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
             "selectedSize": data.get("selectedSize", "Free Size"),
             "selectedColor": data.get("selectedColor", ""),
             "images": data.get("images", []),
-            "createdAt": datetime.utcnow()
+            "createdAt": datetime.now().strftime("%Y-%m-%d")
         }
 
         result = await db["products"].insert_one(product_data)
@@ -499,11 +492,6 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/")
-def home():
-    return {"message": "Welcome to Myha Backend 🚀"}
 
 
 # =============================
@@ -542,7 +530,7 @@ async def add_review(
             "rating": rating,
             "comment": comment,
             "image": image_url,
-            "createdAt": datetime.utcnow()
+            "createdAt": datetime.now().strftime("%Y-%m-%d")
         }
 
         result = await db["reviews"].insert_one(review_data)
