@@ -234,6 +234,22 @@ async def get_products():
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+@app.post("/products")
+async def products_alias(
+    name: str = Form(...),
+    price: float = Form(...),
+    description: str = Form(""),
+    category: str = Form(...),
+    sizes: List[str] = Form(default=["Free Size"]),
+    colors: List[str] = Form(default=["Default"]),
+    images: List[UploadFile] = File(None),
+    authorization: str = Header(None)
+):
+    return await upload_product(
+        name, price, description, category, sizes, colors, images, authorization
+    )
+
+
 @app.get("/product/{product_id}")
 async def get_product(product_id: str):
     try:
