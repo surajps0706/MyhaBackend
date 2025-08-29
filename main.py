@@ -94,9 +94,14 @@ def generate_order_id():
 # =============================
 # Send Email (Order Confirmation)
 # =============================
-def send_order_email(to_email, order_data):
+def send_order_email(to_email, order_data, is_admin=False):
     try:
-        subject = f"Myha Couture - Order Confirmation #{order_data.get('orderId')}"
+        # Subject changes depending on recipient
+        if is_admin:
+            subject = f"📦 New Order Received – Myha Couture #{order_data.get('orderId')}"
+        else:
+            subject = f"Myha Couture - Order Confirmation #{order_data.get('orderId')}"
+
         cart_items = order_data.get("cartItems", [])
         items_html = ""
 
@@ -137,14 +142,22 @@ def send_order_email(to_email, order_data):
             total_amount = total_amount.replace("₹", "").replace(",", "").strip()
         total_amount = float(total_amount)
 
+        # Different message for admin vs customer
+        if is_admin:
+            greeting = f"<h2 style='color:#000;'>🚨 New Order Alert</h2>"
+            intro = f"<p>A new order <b>#{order_data.get('orderId')}</b> has been placed by <b>{order_data['checkoutData']['name']}</b>.</p>"
+        else:
+            greeting = f"<h2 style='color:#000;'>Thank you for shopping with <span style='color:#d63384;'>Myha Couture</span>, {order_data['checkoutData']['name']}!</h2>"
+            intro = f"<p>Your order <b>#{order_data.get('orderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>"
+
         html = f"""
         <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
           <div style="background:#000; padding:20px; text-align:center;">
             <img src="https://res.cloudinary.com/dw35epojg/image/upload/v1754020493/logo_v5px6x.jpg" alt="Myha Logo" style="max-height:50px;" />
           </div>
           <div style="padding:20px;">
-            <h2 style="color:#000;">Thank you for shopping with <span style="color:#d63384;">Myha Couture</span>, {order_data['checkoutData']['name']}!</h2>
-            <p>Your order <b>#{order_data.get('orderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>
+            {greeting}
+            {intro}
             {items_html}
             <p style="margin-top:20px; font-size:16px;"><b>Grand Total: ₹{total_amount:.2f}</b></p>
           </div>
@@ -323,7 +336,10 @@ async def save_order(request: Request):
 
         customer_email = data.get("checkoutData", {}).get("email")
         if customer_email:
-            send_order_email(customer_email, data)
+            send_order_email(customer_email, data, is_admin=False)
+
+        if ADMIN_EMAIL:
+            send_order_email(ADMIN_EMAIL,data,is_admin=True)
 
         return {"message": "Order saved", "id": str(result.inserted_id), "orderId": myha_order_id}
     except Exception as e:
