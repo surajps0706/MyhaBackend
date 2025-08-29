@@ -20,6 +20,8 @@ import random
 from typing import List
 import cloudinary
 import cloudinary.uploader
+import httpx   # ⭐ Delhivery API calls
+import json    # ⭐ for payload formatting
 
 # =============================
 # Load env vars
@@ -33,20 +35,24 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 
 EMAIL_HOST = os.getenv("EMAIL_HOST")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
-EMAIL_USER = os.getenv("EMAIL_USER")     # Brevo login (example: 956372001@smtp-brevo.com)
-EMAIL_PASS = os.getenv("EMAIL_PASS")     # Brevo SMTP key
-EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_USER)  # Branded From address (example: order@myhacouture.com)
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_USER)
 
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
+# ⭐ Delhivery credentials
+DELHIVERY_API_TOKEN = os.getenv("DELHIVERY_API_TOKEN", "")
+DELHIVERY_BASE_URL = os.getenv("DELHIVERY_BASE_URL", "https://staging-express.delhivery.com")
+
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    cloud_name=CLOUDINARY_CLOUD_NAME,
+    api_key=CLOUDINARY_API_KEY,
+    api_secret=CLOUDINARY_API_SECRET,
     secure=True
 )
 
@@ -162,6 +168,44 @@ def send_order_email(to_email, order_data):
 
 
 # =============================
+# ⭐ Delhivery Tracking Helper
+# =============================
+async def fetch_delhivery_tracking(awb: str):
+    url = f"https://track.delhivery.com/api/v1/packages/json/?waybill={awb}"
+    headers = {"Authorization": f"Token {DELHIVERY_API_TOKEN}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as e:
+        print(f"❌ Delhivery API error: {e}")
+        return []
+
+    timeline = []
+    try:
+        shipment_data = data.get("ShipmentData", [])
+        if shipment_data:
+            scans = shipment_data[0]["Shipment"].get("Scans", [])
+            for scan in scans:
+                detail = scan.get("ScanDetail", {})
+                status = detail.get("Scan")
+                # ✅ Only track relevant courier statuses
+                if status in ["Picked Up", "In Transit", "Out for Delivery", "Delivered"]:
+                    timeline.append({
+                        "status": status,
+                        "time": detail.get("ScanDateTime"),
+                        "source": "Delhivery",
+                        "location": detail.get("ScannedLocation")
+                    })
+    except Exception as e:
+        print(f"❌ Error parsing Delhivery response: {e}")
+
+    return timeline
+
+
+# =============================
 # Product APIs
 # =============================
 @app.get("/products")
@@ -269,10 +313,10 @@ async def save_order(request: Request):
         myha_order_id = f"MYHA{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         data["orderId"] = myha_order_id
         data["razorpayOrderId"] = data.get("orderId")
-        data["status"] = "Pending Delivery"  # ✅ Default standardized
+        data["status"] = "Preparing"  # ✅ Default standardized
         data["createdAt"] = datetime.now().strftime("%Y-%m-%d")
         data["statusTimeline"] = {
-             "Pending Delivery": datetime.now().strftime("%Y-%m-%d")
+             "Preparing": datetime.now().strftime("%Y-%m-%d")
         }
 
         result = await db["orders"].insert_one(data)
@@ -299,13 +343,13 @@ async def get_orders(authorization: str = Header(None)):
     orders = []
     async for order in orders_cursor:
         order = fix_id(order)
-        order["orderId"] = order.get("orderId")  # ✅ ensure included
+        order["orderId"] = order.get("orderId")
         orders.append(order)
     return orders
 
 
 # =============================
-# Admin: Update Status
+# Admin: Update Status (with AWB)
 # =============================
 @app.put("/orders/{order_id}/status")
 async def update_order_status(order_id: str, request: Request, authorization: str = Header(None)):
@@ -315,23 +359,80 @@ async def update_order_status(order_id: str, request: Request, authorization: st
     data = await request.json()
     new_status = data.get("status")
 
-    valid_statuses = ["Pending Delivery", "Processing", "Shipped", "Delivered"]
+    valid_statuses = [ "Preparing", "Packed", "Shipped", "Delivered"]
     if new_status not in valid_statuses:
         raise HTTPException(status_code=400, detail="Invalid status")
 
-    # ✅ Fetch the order first
     order = await db["orders"].find_one({"orderId": order_id})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ✅ Update statusTimeline safely
     status_timeline = order.get("statusTimeline", {})
-    status_timeline[new_status] = datetime.now().strftime("%Y-%m-%d")
+    status_timeline[new_status] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    result = await db["orders"].update_one(
-        {"orderId": order_id},
-        {"$set": {"status": new_status, "statusTimeline": status_timeline}}
-    )
+    update_data = {"status": new_status, "statusTimeline": status_timeline}
+
+    # ⭐ Shipment creation when Packed
+    if new_status == "Packed" and not order.get("awb"):
+        shipment_payload = {
+            "shipments": [
+                {
+                    "name": order["checkoutData"].get("name", "Unknown"),
+                    "add": order["checkoutData"].get("address", "Not Provided"),
+                    "pin": order["checkoutData"].get("pincode", ""),
+                    "city": order["checkoutData"].get("city", "Chennai"),
+                    "state": order["checkoutData"].get("state", "Tamil Nadu"),
+                    "country": "India",
+                    "phone": order["checkoutData"]["phone"],
+                    "order": order["orderId"],
+                    "payment_mode": "Prepaid" if order.get("paymentType") == "Prepaid" else "COD",
+                    "cod_amount": float(order.get("totalAmount", 0)) if order.get("paymentType") == "COD" else 0,
+                    "total_amount": float(order.get("totalAmount", 0)),
+                    "products_desc": ", ".join([p["name"] for p in order.get("cartItems", [])]),
+                    "quantity": len(order.get("cartItems", [])),
+                    "weight": 0.5,
+                    "shipment_width": "20",
+                    "shipment_height": "5",
+                    "shipping_mode": "Surface",
+                    "return_add": "Myha Return Address",
+                    "return_pin": "600002",
+                    "return_city": "Chennai",
+                    "return_state": "Tamil Nadu",
+                    "return_country": "India",
+                    "return_phone": "9876543210"
+                }
+            ],
+            "pickup_location": {"name": "Myha"}
+        }
+
+        headers = {
+            "Authorization": f"Token {DELHIVERY_API_TOKEN}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    f"{DELHIVERY_BASE_URL}/api/cmu/create.json",
+                    headers=headers,
+                    data={"format": "json", "data": json.dumps(shipment_payload)}
+                )
+            data = resp.json()
+            print("📦 Delhivery Response:", data)
+
+            if "packages" in data and data["packages"]:
+                awb = data["packages"][0]["waybill"]
+                update_data["awb"] = awb
+            else:
+                dummy_awb = f"DUMMY{random.randint(100000,999999)}"
+                update_data["awb"] = dummy_awb
+        except Exception as e:
+            print(f"❌ Delhivery Shipment creation error: {e}")
+            dummy_awb = f"DUMMY{random.randint(100000,999999)}"
+            update_data["awb"] = dummy_awb
+
+    result = await db["orders"].update_one({"orderId": order_id}, {"$set": update_data})
 
     if result.modified_count == 0:
         raise HTTPException(status_code=500, detail="Failed to update status")
@@ -340,8 +441,41 @@ async def update_order_status(order_id: str, request: Request, authorization: st
         "message": "Status updated successfully",
         "orderId": order_id,
         "status": new_status,
-        "statusTimeline": status_timeline
+        "statusTimeline": status_timeline,
+        "awb": update_data.get("awb", order.get("awb"))
     }
+
+
+# =============================
+# ⭐ Unified Timeline Endpoint
+# =============================
+@app.get("/orders/{order_id}/timeline")
+async def get_order_timeline(order_id: str):
+    order = await db["orders"].find_one({"orderId": order_id})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    admin_timeline = []
+    for status, time in order.get("statusTimeline", {}).items():
+        admin_timeline.append({
+            "status": status,
+            "time": time,
+            "source": "Admin"
+        })
+
+    courier_timeline = []
+    if order.get("awb"):
+        courier_timeline = await fetch_delhivery_tracking(order["awb"])
+
+    full_timeline = admin_timeline + courier_timeline
+    full_timeline.sort(key=lambda x: x["time"])
+
+    return {
+        "orderId": order_id,
+        "awb": order.get("awb"),
+        "timeline": full_timeline
+    }
+
 
 # =============================
 # Admin: Export Orders
@@ -362,6 +496,7 @@ async def export_orders(authorization: str = Header(None)):
             "Phone": order.get("checkoutData", {}).get("phone"),
             "Total Amount": order.get("totalAmount"),
             "Status": order.get("status"),
+            "AWB": order.get("awb") or "—",
             "Created At": created_at
         })
 
@@ -429,7 +564,7 @@ async def update_product(product_id: str, request: Request, authorization: str =
 @app.get("/orders/{order_id}")
 async def get_order(order_id: str):
     try:
-        order = await db["orders"].find_one({"orderId": order_id})  # ✅ FIXED: match by orderId
+        order = await db["orders"].find_one({"orderId": order_id})
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
         return fix_id(order)
