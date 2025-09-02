@@ -181,13 +181,15 @@ def send_order_email(to_email, order_data, is_admin=False):
     except Exception as e:
         print(f"❌ Failed to send email: {e}")
 
-
 # =============================
 # ⭐ Delhivery Tracking Helper
 # =============================
 async def fetch_delhivery_tracking(awb: str):
-    url = f"https://track.delhivery.com/api/v1/packages/json/?waybill={awb}"
-    headers = {"Authorization": f"Token {DELHIVERY_API_TOKEN}"}
+    url = f"{DELHIVERY_BASE_URL}/api/v1/packages/json/?waybill={awb}"
+    headers = {
+        "Authorization": f"Token {DELHIVERY_API_TOKEN}",
+        "Accept": "application/json"
+    }
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -201,24 +203,26 @@ async def fetch_delhivery_tracking(awb: str):
     timeline = []
     try:
         shipment_data = data.get("ShipmentData", [])
-        if shipment_data:
+        if shipment_data and "Shipment" in shipment_data[0]:
             scans = shipment_data[0]["Shipment"].get("Scans", [])
             for scan in scans:
                 detail = scan.get("ScanDetail", {})
-                status = detail.get("Scan")
-                # ✅ Only track relevant courier statuses
+                status = detail.get("Scan", "")
+                scan_time = detail.get("ScanDateTime")
+                location = detail.get("ScannedLocation")
+
+                # ✅ Track only major statuses
                 if status in ["Picked Up", "In Transit", "Out for Delivery", "Delivered"]:
                     timeline.append({
                         "status": status,
-                        "time": detail.get("ScanDateTime"),
+                        "time": scan_time,
                         "source": "Delhivery",
-                        "location": detail.get("ScannedLocation")
+                        "location": location
                     })
     except Exception as e:
         print(f"❌ Error parsing Delhivery response: {e}")
 
     return timeline
-
 
 # =============================
 # Product APIs
@@ -706,3 +710,50 @@ async def add_review(
         return {"message": "✅ Review added", "id": str(result.inserted_id), "review": review_data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# =============================
+# Admin: Cancel Order
+# =============================
+@app.put("/orders/{order_id}/cancel")
+async def cancel_order(order_id: str, authorization: str = Header(None)):
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Find the order
+    order = await db["orders"].find_one({"orderId": order_id})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    awb = order.get("awb")
+    delhivery_response = None
+
+    if awb:
+        # Cancel shipment in Delhivery
+        url = f"{DELHIVERY_BASE_URL}/api/p/edit"
+        headers = {
+            "Authorization": f"Token {DELHIVERY_API_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        payload = {"waybill": awb, "cancellation": "true"}
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                delhivery_response = resp.json()
+                print("📦 Cancel Response:", delhivery_response)
+        except Exception as e:
+            print(f"❌ Error cancelling shipment: {e}")
+
+    # Update DB
+    await db["orders"].update_one(
+        {"orderId": order_id},
+        {"$set": {"status": "Cancelled"}}
+    )
+
+    return {
+        "message": "Order cancelled successfully",
+        "orderId": order_id,
+        "awb": awb,
+        "delhiveryResponse": delhivery_response
+    }
