@@ -92,29 +92,29 @@ def generate_order_id():
     now = datetime.utcnow()
     return f"MYHA{now.strftime('%Y%m%d%H%M%S')}{random.randint(100,999)}"
 
-
 # =============================
-# Send Email (Order Confirmation)
+# Send Email (Order Confirmation with Shipping + Product Images)
 # =============================
 def send_order_email(to_email, order_data, is_admin=False):
     try:
-        # Subject changes depending on recipient
+        # Subject line
         if is_admin:
             subject = f"📦 New Order Received – Myha Couture #{order_data.get('orderId')}"
         else:
             subject = f"Myha Couture - Order Confirmation #{order_data.get('orderId')}"
 
+        checkout = order_data.get("checkoutData", {})
         cart_items = order_data.get("cartItems", [])
         items_html = ""
 
         if cart_items:
             items_html += """
-            <table style="width:100%; border-collapse:collapse; margin-top:20px;">
+            <table style="width:100%; border-collapse:collapse; margin-top:20px; font-size:14px;">
               <thead>
-                <tr style="background:#f5f5f5;">
+                <tr style="background:#f9f9f9;">
+                  <th style="border:1px solid #ddd; padding:8px; text-align:left;">Image</th>
                   <th style="border:1px solid #ddd; padding:8px; text-align:left;">Product</th>
-                  <th style="border:1px solid #ddd; padding:8px; text-align:right;">Price</th>
-                  <th style="border:1px solid #ddd; padding:8px; text-align:right;">Qty</th>
+                  <th style="border:1px solid #ddd; padding:8px; text-align:center;">Qty</th>
                   <th style="border:1px solid #ddd; padding:8px; text-align:right;">Total</th>
                 </tr>
               </thead>
@@ -129,11 +129,33 @@ def send_order_email(to_email, order_data, is_admin=False):
 
                 qty = int(item.get("quantity", 1))
                 total = price * qty
+                image = item.get("images", [""])[0]
+
+                # extra details
+                size = item.get("selectedSize", "")
+                sleeve = item.get("sleeveType", "")
+                sleeve_price = item.get("sleevePrice", 0)
+                height = item.get("preferredHeight", "")
+                height_price = item.get("extraHeightPrice", 0)
+
+                extra_html = ""
+                if size:
+                    extra_html += f"Size: {size}<br>"
+                if sleeve:
+                    extra_html += f"Sleeve: {sleeve} (+₹{sleeve_price})<br>"
+                if height:
+                    extra_html += f"Height: {height} (+₹{height_price})<br>"
+
                 items_html += f"""
                 <tr>
-                  <td style="border:1px solid #ddd; padding:8px;">{name}</td>
-                  <td style="border:1px solid #ddd; padding:8px; text-align:right;">₹{price:.2f}</td>
-                  <td style="border:1px solid #ddd; padding:8px; text-align:right;">{qty}</td>
+                  <td style="border:1px solid #ddd; padding:8px; text-align:center;">
+                    <img src="{image}" alt="{name}" style="max-width:60px; border-radius:6px;" />
+                  </td>
+                  <td style="border:1px solid #ddd; padding:8px;">
+                    <strong>{name}</strong><br>
+                    {extra_html}
+                  </td>
+                  <td style="border:1px solid #ddd; padding:8px; text-align:center;">{qty}</td>
                   <td style="border:1px solid #ddd; padding:8px; text-align:right;">₹{total:.2f}</td>
                 </tr>
                 """
@@ -144,22 +166,38 @@ def send_order_email(to_email, order_data, is_admin=False):
             total_amount = total_amount.replace("₹", "").replace(",", "").strip()
         total_amount = float(total_amount)
 
-        # Different message for admin vs customer
+        # Greeting / Intro
         if is_admin:
             greeting = f"<h2 style='color:#000;'>🚨 New Order Alert</h2>"
-            intro = f"<p>A new order <b>#{order_data.get('orderId')}</b> has been placed by <b>{order_data['checkoutData']['name']}</b>.</p>"
+            intro = f"<p>A new order <b>#{order_data.get('orderId')}</b> has been placed by <b>{checkout.get('name')}</b>.</p>"
         else:
-            greeting = f"<h2 style='color:#000;'>Thank you for shopping with <span style='color:#d63384;'>Myha Couture</span>, {order_data['checkoutData']['name']}!</h2>"
+            greeting = f"<h2 style='color:#000;'>Thank you for shopping with <span style='color:#d63384;'>Myha Couture</span>, {checkout.get('name')}!</h2>"
             intro = f"<p>Your order <b>#{order_data.get('orderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>"
 
+        # Shipping details block
+        shipping_html = f"""
+        <div style="margin-top:20px; font-size:14px; line-height:1.5;">
+          <h3 style="margin-bottom:8px;">📍 Shipping Details</h3>
+          <p>
+            {checkout.get('name')}<br>
+            {checkout.get('addressLine1')}<br>
+            {checkout.get('addressLine2', '')}<br>
+            {checkout.get('city')}, {checkout.get('state')} - {checkout.get('pincode')}<br>
+            Phone: {checkout.get('phone')}<br>
+            Email: {checkout.get('email')}
+          </p>
+        </div>
+        """
+
         html = f"""
-        <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
+        <div style="font-family: Arial, sans-serif; color: #333; max-width: 650px; margin: auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
           <div style="background:#000; padding:20px; text-align:center;">
             <img src="https://res.cloudinary.com/dw35epojg/image/upload/v1754020493/logo_v5px6x.jpg" alt="Myha Logo" style="max-height:50px;" />
           </div>
           <div style="padding:20px;">
             {greeting}
             {intro}
+            {shipping_html}
             {items_html}
             <p style="margin-top:20px; font-size:16px;"><b>Grand Total: ₹{total_amount:.2f}</b></p>
           </div>
