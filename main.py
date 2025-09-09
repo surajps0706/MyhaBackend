@@ -1,12 +1,12 @@
 from fastapi import FastAPI, HTTPException, Request, Header, UploadFile, File, Form
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
 from models import Product
 from database import db
 from bson import ObjectId
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from fastapi import FastAPI, UploadFile, File, Form
+
 import razorpay
 import os
 import smtplib
@@ -17,11 +17,12 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
 import random
-from typing import List
+from typing import List, Optional, Dict, Any
 import cloudinary
 import cloudinary.uploader
 import httpx   # ⭐ Delhivery API calls
 import json    # ⭐ for payload formatting
+
 
 # =============================
 # Load env vars
@@ -39,7 +40,6 @@ EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_USER)
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", EMAIL_USER)  # fallback to main email if not set
-
 
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
@@ -60,18 +60,20 @@ cloudinary.config(
 
 app = FastAPI()
 
+
 @app.get("/")
 def root():
     return {"message": "Welcome to Myha Backend 🚀"}
 
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:4200",
         "https://taupe-cannoli-010c45.netlify.app",
         "https://myhacouture.com",
-        "https://www.myhacouture.com"
+        "https://www.myhacouture.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -79,18 +81,59 @@ app.add_middleware(
 )
 
 
-def fix_id(doc):
+# =============================
+# Helpers
+# =============================
+def fix_id(doc: Dict[str, Any]) -> Dict[str, Any]:
     doc["id"] = str(doc["_id"])
     doc.pop("_id", None)
     return doc
 
 
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 # =============================
-# Utility: Generate Professional Order ID
+# App startup: indexes
+# =============================
+@app.on_event("startup")
+async def _ensure_indexes():
+    coll = db["orders"]
+
+    # Ensure orderId unique
+    try:
+        await coll.create_index([("orderId", 1)], name="orderId_1", unique=True)
+    except OperationFailure as e:
+        print(f"Index create warning (orderId): {e}")
+
+    # Handle createdAt index: if TTL exists, drop and recreate without TTL
+    try:
+        idx_list = await coll.list_indexes().to_list(length=None)
+        for idx in idx_list:
+            if idx.get("key") == {"createdAt": 1}:
+                # If TTL present, drop it
+                if "expireAfterSeconds" in idx:
+                    try:
+                        await coll.drop_index(idx["name"])
+                        print(f"Dropped TTL index {idx['name']} on createdAt")
+                    except OperationFailure as e:
+                        print(f"Drop index warning: {e}")
+                break
+
+        # Recreate plain index (non-TTL)
+        await coll.create_index([("createdAt", 1)], name="createdAt_1")
+    except OperationFailure as e:
+        print(f"Index create warning (createdAt): {e}")
+
+
+# =============================
+# Utility: Generate Professional Order ID (kept for reference if needed elsewhere)
 # =============================
 def generate_order_id():
     now = datetime.utcnow()
     return f"MYHA{now.strftime('%Y%m%d%H%M%S')}{random.randint(100,999)}"
+
 
 # =============================
 # Send Email (Order Confirmation with Shipping + Product Images)
@@ -125,18 +168,18 @@ def send_order_email(to_email, order_data, is_admin=False):
                 price = item.get("price", 0)
                 if isinstance(price, str):
                     price = price.replace("₹", "").replace(",", "").strip()
-                price = float(price)
+                price = float(price or 0)
 
                 qty = int(item.get("quantity", 1))
                 total = price * qty
-                image = item.get("images", [""])[0]
+                image = item.get("images", [""])[0] if item.get("images") else item.get("image", "")
 
                 # extra details
                 size = item.get("selectedSize", "")
                 sleeve = item.get("sleeveType", "")
-                sleeve_price = item.get("sleevePrice", 0)
+                sleeve_price = float(item.get("sleevePrice", 0) or 0)
                 height = item.get("preferredHeight", "")
-                height_price = item.get("extraHeightPrice", 0)
+                height_price = float(item.get("extraHeightPrice", 0) or 0)
 
                 extra_html = ""
                 if size:
@@ -164,7 +207,7 @@ def send_order_email(to_email, order_data, is_admin=False):
         total_amount = order_data.get("totalAmount", 0)
         if isinstance(total_amount, str):
             total_amount = total_amount.replace("₹", "").replace(",", "").strip()
-        total_amount = float(total_amount)
+        total_amount = float(total_amount or 0)
 
         # Greeting / Intro
         if is_admin:
@@ -219,6 +262,7 @@ def send_order_email(to_email, order_data, is_admin=False):
     except Exception as e:
         print(f"❌ Failed to send email: {e}")
 
+
 # =============================
 # ⭐ Delhivery Tracking Helper
 # =============================
@@ -262,6 +306,7 @@ async def fetch_delhivery_tracking(awb: str):
 
     return timeline
 
+
 # =============================
 # Product APIs
 # =============================
@@ -276,21 +321,6 @@ async def get_products():
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# @app.post("/products")
-# async def products_alias(
-#     name: str = Form(...),
-#     price: float = Form(...),
-#     description: str = Form(""),
-#     category: str = Form(...),
-#     sizes: List[str] = Form(default=["Free Size"]),
-#     colors: List[str] = Form(default=["Default"]),
-#     images: List[UploadFile] = File(None),
-#     authorization: str = Header(None)
-# ):
-#     return await upload_product(
-#         name, price, description, category, sizes, colors, images, authorization
-#     )
-
 
 @app.get("/product/{product_id}")
 async def get_product(product_id: str):
@@ -302,15 +332,17 @@ async def get_product(product_id: str):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+
 @app.post("/add-product")
 async def add_product(product: Product):
     try:
         product_data = product.dict()
-        product_data["createdAt"] = datetime.now().strftime("%Y-%m-%d")
+        product_data["createdAt"] = iso_now()
         result = await db["products"].insert_one(product_data)
         return {"message": "Product added", "id": str(result.inserted_id)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 @app.post("/upload-product")
 async def upload_product(
@@ -341,7 +373,7 @@ async def upload_product(
             "sizes": sizes,
             "colors": colors,
             "images": image_urls,
-            "createdAt": datetime.now().strftime("%Y-%m-%d")
+            "createdAt": iso_now()
         }
 
         result = await db["products"].insert_one(product_data)
@@ -366,7 +398,7 @@ async def create_order(request: Request):
 
     try:
         razorpay_order = razorpay_client.order.create({
-            "amount": amount * 100,
+            "amount": int(float(amount) * 100),
             "currency": currency,
             "receipt": receipt,
             "notes": notes
@@ -378,28 +410,64 @@ async def create_order(request: Request):
 
 # =============================
 # Save Order & Send Email
+# (Normalized cartItems + ISO timestamps)
 # =============================
 @app.post("/save-order")
 async def save_order(request: Request):
     data = await request.json()
     try:
+        # Order IDs
         myha_order_id = f"MYHA{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         data["orderId"] = myha_order_id
         data["razorpayOrderId"] = data.get("orderId")
-        data["status"] = "Preparing"  # ✅ Default standardized
-        data["createdAt"] = datetime.now().strftime("%Y-%m-%d")
-        data["statusTimeline"] = {
-             "Preparing": datetime.now().strftime("%Y-%m-%d")
-        }
 
+        # Timestamps
+        now = iso_now()
+        data["status"] = "Preparing"  # ✅ Default standardized
+        data["createdAt"] = now
+        data["statusTimeline"] = {"Preparing": now}
+
+        # Normalize cart items for stable admin detail view
+        normalized_items = []
+        for it in data.get("cartItems", []):
+            price = it.get("price", 0)
+            if isinstance(price, str):
+                price = price.replace("₹", "").replace(",", "").strip()
+            price = float(price or 0)
+
+            qty = int(it.get("quantity", 1))
+            sleeve_price = float(it.get("sleevePrice", 0) or 0)
+            height_price = float(it.get("extraHeightPrice", 0) or 0)
+
+            line_total = (price + sleeve_price + height_price) * qty
+
+            normalized_items.append({
+                "productId": it.get("productId") or it.get("_id"),
+                "name": it.get("name", "N/A"),
+                "image": (it.get("images") or [""])[0] if it.get("images") else it.get("image", ""),
+                "price": price,
+                "quantity": qty,
+                "selectedSize": it.get("selectedSize"),
+                "sleeveType": it.get("sleeveType"),
+                "sleevePrice": sleeve_price,
+                "preferredHeight": it.get("preferredHeight"),
+                "extraHeightPrice": height_price,
+                "lineTotal": line_total
+            })
+
+        # Write back normalized items
+        if normalized_items:
+            data["cartItems"] = normalized_items
+
+        # Insert
         result = await db["orders"].insert_one(data)
 
+        # Emails
         customer_email = data.get("checkoutData", {}).get("email")
         if customer_email:
             send_order_email(customer_email, data, is_admin=False)
-
         if ADMIN_EMAIL:
-            send_order_email(ADMIN_EMAIL,data,is_admin=True)
+            send_order_email(ADMIN_EMAIL, data, is_admin=True)
 
         return {"message": "Order saved", "id": str(result.inserted_id), "orderId": myha_order_id}
     except Exception as e:
@@ -408,19 +476,28 @@ async def save_order(request: Request):
 
 
 # =============================
-# Admin: View Orders
+# Admin: View Orders (projection + sort)
 # =============================
 @app.get("/orders")
 async def get_orders(authorization: str = Header(None)):
     if authorization != f"Bearer {ADMIN_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    orders_cursor = db["orders"].find().sort("createdAt", -1)
-    orders = []
-    async for order in orders_cursor:
-        order = fix_id(order)
-        order["orderId"] = order.get("orderId")
-        orders.append(order)
+    cursor = db["orders"].find(
+        {},
+        {
+            "_id": 0,
+            "orderId": 1,
+            "status": 1,
+            "createdAt": 1,
+            "awb": 1,
+            "totalAmount": 1,
+            "checkoutData.name": 1,
+            "checkoutData.phone": 1,
+        }
+    ).sort("createdAt", -1)
+
+    orders = [o async for o in cursor]
     return orders
 
 
@@ -435,7 +512,7 @@ async def update_order_status(order_id: str, request: Request, authorization: st
     data = await request.json()
     new_status = data.get("status")
 
-    valid_statuses = [ "Preparing", "Packed", "Shipped", "Delivered"]
+    valid_statuses = ["Preparing", "Packed", "Shipped", "Delivered", "Cancelled"]
     if new_status not in valid_statuses:
         raise HTTPException(status_code=400, detail="Invalid status")
 
@@ -444,9 +521,9 @@ async def update_order_status(order_id: str, request: Request, authorization: st
         raise HTTPException(status_code=404, detail="Order not found")
 
     status_timeline = order.get("statusTimeline", {})
-    status_timeline[new_status] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status_timeline[new_status] = iso_now()
 
-    update_data = {"status": new_status, "statusTimeline": status_timeline}
+    update_data: Dict[str, Any] = {"status": new_status, "statusTimeline": status_timeline}
 
     # ⭐ Shipment creation when Packed
     if new_status == "Packed" and not order.get("awb"):
@@ -454,17 +531,17 @@ async def update_order_status(order_id: str, request: Request, authorization: st
             "shipments": [
                 {
                     "name": order["checkoutData"].get("name", "Unknown"),
-                    "add": order["checkoutData"].get("address", "Not Provided"),
+                    "add": order["checkoutData"].get("address", order["checkoutData"].get("addressLine1", "Not Provided")),
                     "pin": order["checkoutData"].get("pincode", ""),
                     "city": order["checkoutData"].get("city", "Chennai"),
                     "state": order["checkoutData"].get("state", "Tamil Nadu"),
                     "country": "India",
-                    "phone": order["checkoutData"]["phone"],
+                    "phone": order["checkoutData"].get("phone", ""),
                     "order": order["orderId"],
                     "payment_mode": "Prepaid" if order.get("paymentType") == "Prepaid" else "COD",
                     "cod_amount": float(order.get("totalAmount", 0)) if order.get("paymentType") == "COD" else 0,
-                    "total_amount": float(order.get("totalAmount", 0)),
-                    "products_desc": ", ".join([p["name"] for p in order.get("cartItems", [])]),
+                    "total_amount": float(order.get("totalAmount", 0) or 0),
+                    "products_desc": ", ".join([p.get("name", "") for p in order.get("cartItems", [])]),
                     "quantity": len(order.get("cartItems", [])),
                     "weight": 0.5,
                     "shipment_width": "20",
@@ -544,7 +621,8 @@ async def get_order_timeline(order_id: str):
         courier_timeline = await fetch_delhivery_tracking(order["awb"])
 
     full_timeline = admin_timeline + courier_timeline
-    full_timeline.sort(key=lambda x: x["time"])
+    # Note: both ISO strings and Delhivery timestamps are sortable strings (best-effort)
+    full_timeline.sort(key=lambda x: x.get("time", ""))
 
     return {
         "orderId": order_id,
@@ -562,10 +640,10 @@ async def export_orders(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     orders_cursor = db["orders"].find().sort("createdAt", -1)
-    orders = []
+    rows = []
     async for order in orders_cursor:
         created_at = str(order.get("createdAt", ""))
-        orders.append({
+        rows.append({
             "Order ID": order.get("orderId"),
             "Customer": order.get("checkoutData", {}).get("name"),
             "Email": order.get("checkoutData", {}).get("email"),
@@ -576,7 +654,7 @@ async def export_orders(authorization: str = Header(None)):
             "Created At": created_at
         })
 
-    df = pd.DataFrame(orders)
+    df = pd.DataFrame(rows)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Orders")
@@ -600,7 +678,7 @@ async def admin_login(request: Request):
 
     if username == os.getenv("ADMIN_USER", "admin") and password == os.getenv("ADMIN_PASSWORD", "super-secret"):
         return {"token": os.getenv("ADMIN_TOKEN", "myha-secret")}
-    
+
     raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
@@ -635,17 +713,17 @@ async def update_product(product_id: str, request: Request, authorization: str =
 
 
 # =============================
-# Get Single Order by ID (Admin)
+# Get Single Order by ID (Admin, secured)
 # =============================
 @app.get("/orders/{order_id}")
-async def get_order(order_id: str):
-    try:
-        order = await db["orders"].find_one({"orderId": order_id})
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-        return fix_id(order)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_order(order_id: str, authorization: str = Header(None)):
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    order = await db["orders"].find_one({"orderId": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
 
 
 # =============================
@@ -689,7 +767,7 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
             "selectedSize": data.get("selectedSize", "Free Size"),
             "selectedColor": data.get("selectedColor", ""),
             "images": data.get("images", []),
-            "createdAt": datetime.now().strftime("%Y-%m-%d")
+            "createdAt": iso_now()
         }
 
         result = await db["products"].insert_one(product_data)
@@ -714,10 +792,10 @@ async def get_reviews(product_id: str):
         reviews_cursor = db["reviews"].find({"productId": product_id}).sort("createdAt", -1)
         reviews = []
         async for review in reviews_cursor:
-                reviews.append(fix_id(review))
+            reviews.append(fix_id(review))
         return reviews
     except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/products/{product_id}/reviews")
@@ -741,13 +819,14 @@ async def add_review(
             "rating": rating,
             "comment": comment,
             "image": image_url,
-            "createdAt": datetime.now().strftime("%Y-%m-%d")
+            "createdAt": iso_now()
         }
 
         result = await db["reviews"].insert_one(review_data)
         return {"message": "✅ Review added", "id": str(result.inserted_id), "review": review_data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # =============================
 # Admin: Cancel Order
@@ -786,7 +865,7 @@ async def cancel_order(order_id: str, authorization: str = Header(None)):
     # Update DB
     await db["orders"].update_one(
         {"orderId": order_id},
-        {"$set": {"status": "Cancelled"}}
+        {"$set": {"status": "Cancelled", "statusTimeline.Cancelled": iso_now()}}
     )
 
     return {
