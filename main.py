@@ -452,7 +452,9 @@ async def save_order(request: Request):
                 "sleevePrice": sleeve_price,
                 "preferredHeight": it.get("preferredHeight"),
                 "extraHeightPrice": height_price,
-                "lineTotal": line_total
+                "lineTotal": line_total,
+                "measurements": it.get("measurements", {}),
+                "customizationNotes": it.get("customizationNotes", "")
             })
 
         # Write back normalized items
