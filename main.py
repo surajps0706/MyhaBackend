@@ -800,7 +800,6 @@ async def get_reviews(product_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/products/{product_id}/reviews")
 async def add_review(
     product_id: str,
@@ -812,8 +811,8 @@ async def add_review(
     try:
         image_url = None
         if image:
-            contents = await image.read()
-            upload_result = cloudinary.uploader.upload(contents, folder="reviews")
+            # ✅ FIX: use file-like object for Cloudinary
+            upload_result = cloudinary.uploader.upload(image.file, folder="reviews")
             image_url = upload_result["secure_url"]
 
         review_data = {
@@ -826,18 +825,22 @@ async def add_review(
         }
 
         result = await db["reviews"].insert_one(review_data)
+
+        # ✅ Add string id to the response object
+        review_data["id"] = str(result.inserted_id)
+
         return JSONResponse(
             content={
                 "success": True,
-                "message": "Review added",
-                "id": str(result.inserted_id),
+                "message": "✅ Review added",
                 "review": review_data
             },
             status_code=201
         )
-        # return {"message": "✅ Review added", "id": str(result.inserted_id), "review": review_data}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print("❌ Error adding review:", e)  # log error for debugging
+        raise HTTPException(status_code=500, detail=f"Review add failed: {str(e)}")
 
 
 # =============================
