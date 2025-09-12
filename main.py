@@ -785,7 +785,6 @@ async def add_product_url(request: Request, authorization: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # =============================
 # Reviews API
 # =============================
@@ -795,10 +794,11 @@ async def get_reviews(product_id: str):
         reviews_cursor = db["reviews"].find({"productId": product_id}).sort("createdAt", -1)
         reviews = []
         async for review in reviews_cursor:
-            reviews.append(fix_id(review))
+            reviews.append(fix_id(review))  # ✅ converts _id → id (string)
         return reviews
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/products/{product_id}/reviews")
 async def add_review(
@@ -811,7 +811,7 @@ async def add_review(
     try:
         image_url = None
         if image:
-            # ✅ FIX: use file-like object for Cloudinary
+            # ✅ use file-like object for Cloudinary
             upload_result = cloudinary.uploader.upload(image.file, folder="reviews")
             image_url = upload_result["secure_url"]
 
@@ -826,22 +826,22 @@ async def add_review(
 
         result = await db["reviews"].insert_one(review_data)
 
-        # ✅ Add string id to the response object
-        review_data["id"] = str(result.inserted_id)
+        # ✅ Instead of returning raw review_data (which has no _id), fetch + fix
+        saved_review = await db["reviews"].find_one({"_id": result.inserted_id})
+        saved_review = fix_id(saved_review)  # removes ObjectId, adds string id
 
         return JSONResponse(
             content={
                 "success": True,
                 "message": "✅ Review added",
-                "review": review_data
+                "review": saved_review
             },
             status_code=201
         )
 
     except Exception as e:
-        print("❌ Error adding review:", e)  # log error for debugging
+        print("❌ Error adding review:", e)
         raise HTTPException(status_code=500, detail=f"Review add failed: {str(e)}")
-
 
 # =============================
 # Admin: Cancel Order
