@@ -811,8 +811,8 @@ async def add_review(
     try:
         image_url = None
         if image:
-            # ✅ use file-like object for Cloudinary
-            upload_result = cloudinary.uploader.upload(image.file, folder="reviews")
+            contents = await image.read()
+            upload_result = cloudinary.uploader.upload(contents, folder="reviews")
             image_url = upload_result["secure_url"]
 
         review_data = {
