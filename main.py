@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Header, UploadFile, File, F
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
 from models import Product
 from database import db
@@ -825,7 +826,16 @@ async def add_review(
         }
 
         result = await db["reviews"].insert_one(review_data)
-        return {"message": "✅ Review added", "id": str(result.inserted_id), "review": review_data}
+        return JSONResponse(
+            content={
+                "success": True,
+                "message": "Review added",
+                "id": str(result.inserted_id),
+                "review": review_data
+            },
+            status_code=201
+        )
+        # return {"message": "✅ Review added", "id": str(result.inserted_id), "review": review_data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
