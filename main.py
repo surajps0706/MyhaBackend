@@ -30,7 +30,7 @@ import json    # ⭐ for payload formatting
 # =============================
 load_dotenv()
 
-router = APIRouter()
+# router = APIRouter()
 
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "myha-secret")
@@ -64,7 +64,7 @@ cloudinary.config(
 )
 
 app = FastAPI()
-app.include_router(router, prefix="")  # keep at root
+# app.include_router(router, prefix="") 
 
 
 @app.get("/")
@@ -904,13 +904,13 @@ async def add_review(
 # shipment charge
 # =============================
 
-@router.get("/shipping-charge")
+@app.get("/shipping-charge")
 async def get_shipping_charge(d_pin: str, weight: int = 500, pt: str = "Pre-paid"):
     params = {
         "md": "E",
         "ss": "Delivered",
         "d_pin": d_pin,
-        "o_pin": "600001",   # replace with your warehouse pincode
+        "o_pin": "603109",   # replace with your warehouse pincode
         "cgm": weight,
         "pt": pt
     }
