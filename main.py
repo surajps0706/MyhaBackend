@@ -64,7 +64,7 @@ cloudinary.config(
 )
 
 app = FastAPI()
-app.include_router(router)
+app.include_router(router, prefix="")  # keep at root
 
 
 @app.get("/")
