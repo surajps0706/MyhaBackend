@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Header, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, Header, UploadFile, File, Form,APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -30,6 +30,9 @@ import json    # ⭐ for payload formatting
 # =============================
 load_dotenv()
 
+router = APIRouter()
+
+
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "myha-secret")
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
@@ -48,7 +51,8 @@ CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
 # ⭐ Delhivery credentials
 DELHIVERY_API_TOKEN = os.getenv("DELHIVERY_API_TOKEN", "")
-DELHIVERY_BASE_URL = os.getenv("DELHIVERY_BASE_URL", "https://staging-express.delhivery.com")
+DELHIVERY_BASE_URL = os.getenv("DELHIVERY_BASE_URL",  "https://track.delhivery.com")
+ORIGIN_PINCODE = os.getenv("ORIGIN_PINCODE")
 
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
@@ -408,6 +412,36 @@ async def create_order(request: Request):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+async def fetch_shipping_charge(destination_pincode: str, weight: int = 500, pt: str = "Pre-paid"):
+    """Call Delhivery API to get shipping charge."""
+    params = {
+        "md": "E",
+        "ss": "Delivered",
+        "d_pin": destination_pincode,
+        "o_pin": ORIGIN_PINCODE,
+        "cgm": weight,
+        "pt": pt
+    }
+    headers = {
+        "Authorization": f"Token {DELHIVERY_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{DELHIVERY_BASE_URL}/api/kinko/v1/invoice/charges/.json",
+            params=params,
+            headers=headers
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch shipping charges")
+
+    data = response.json()
+    return data.get("total_amount", 0)  # adjust if Delhivery uses another key
+
+
+
 
 # =============================
 # Save Order & Send Email
@@ -424,11 +458,11 @@ async def save_order(request: Request):
 
         # Timestamps
         now = iso_now()
-        data["status"] = "Preparing"  # ✅ Default standardized
+        data["status"] = "Preparing"
         data["createdAt"] = now
         data["statusTimeline"] = {"Preparing": now}
 
-        # Normalize cart items for stable admin detail view
+        # Normalize cart items
         normalized_items = []
         for it in data.get("cartItems", []):
             price = it.get("price", 0)
@@ -458,21 +492,43 @@ async def save_order(request: Request):
                 "customizationNotes": it.get("customizationNotes", "")
             })
 
-        # Write back normalized items
         if normalized_items:
             data["cartItems"] = normalized_items
 
-        # Insert
+        # 🔹 Calculate totals
+        cart_total = sum(it["lineTotal"] for it in normalized_items)
+
+        # Get shipping cost (based on checkoutData.pincode)
+        checkout = data.get("checkoutData", {})
+        dest_pincode = checkout.get("pincode")
+        shipping_cost = 0
+        if dest_pincode:
+            shipping_cost = await fetch_shipping_charge(dest_pincode)
+
+        grand_total = cart_total + shipping_cost
+
+        data["cartTotal"] = cart_total
+        data["shippingCost"] = shipping_cost
+        data["grandTotal"] = grand_total
+
+        # Save into DB
         result = await db["orders"].insert_one(data)
 
         # Emails
-        customer_email = data.get("checkoutData", {}).get("email")
+        customer_email = checkout.get("email")
         if customer_email:
             send_order_email(customer_email, data, is_admin=False)
         if ADMIN_EMAIL:
             send_order_email(ADMIN_EMAIL, data, is_admin=True)
 
-        return {"message": "Order saved", "id": str(result.inserted_id), "orderId": myha_order_id}
+        return {
+            "message": "Order saved",
+            "id": str(result.inserted_id),
+            "orderId": myha_order_id,
+            "shippingCost": shipping_cost,
+            "grandTotal": grand_total
+        }
+
     except Exception as e:
         print("❌ ERROR saving order:", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -844,6 +900,38 @@ async def add_review(
         raise HTTPException(status_code=500, detail=f"Review add failed: {str(e)}")
 
 # =============================
+# shipment charge
+# =============================
+
+@router.get("/shipping-charge")
+async def get_shipping_charge(d_pin: str, weight: int = 500, pt: str = "Pre-paid"):
+    params = {
+        "md": "E",
+        "ss": "Delivered",
+        "d_pin": d_pin,
+        "o_pin": "600001",   # replace with your warehouse pincode
+        "cgm": weight,
+        "pt": pt
+    }
+
+    headers = {
+        "Authorization": f"Token {DELHIVERY_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{DELHIVERY_BASE_URL}/api/kinko/v1/invoice/charges/.json",
+            params=params,
+            headers=headers
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch shipping charges")
+
+    return response.json()
+
+# =============================
 # Admin: Cancel Order
 # =============================
 @app.put("/orders/{order_id}/cancel")
@@ -889,3 +977,5 @@ async def cancel_order(order_id: str, authorization: str = Header(None)):
         "awb": awb,
         "delhiveryResponse": delhivery_response
     }
+
+
