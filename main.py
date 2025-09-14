@@ -907,7 +907,7 @@ async def add_review(
 @app.get("/shipping-charge")
 async def get_shipping_charge(d_pin: str, weight: int = 500, pt: str = "Pre-paid"):
     params = {
-        "md": "E",
+        "md": "S",
         "ss": "Delivered",
         "d_pin": d_pin,
         "o_pin": "603109",   # replace with your warehouse pincode
