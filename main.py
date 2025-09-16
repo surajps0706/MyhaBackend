@@ -458,7 +458,6 @@ async def save_order(request: Request):
         data["razorpayOrderId"] = data.get("razorpayOrderId")
         data["razorpayPaymentId"] = data.get("razorpayPaymentId")
 
-
         # Timestamps
         now = iso_now()
         data["status"] = "Preparing"
@@ -502,11 +501,18 @@ async def save_order(request: Request):
         cart_total = sum(it["lineTotal"] for it in normalized_items)
 
         # Get shipping cost (based on checkoutData.pincode)
-        checkout = data.get("checkoutData", {})
-        dest_pincode = checkout.get("pincode")
+        checkout = data.get("checkoutData") or {}
+        if isinstance(checkout, list):
+            checkout = checkout[0] if checkout else {}
+
+        dest_pincode = checkout.get("pincode") if isinstance(checkout, dict) else None
         shipping_cost = 0
         if dest_pincode:
-            shipping_cost = await fetch_shipping_charge(dest_pincode)
+            try:
+                shipping_cost = await fetch_shipping_charge(dest_pincode)
+            except Exception as e:
+                print("⚠️ Shipping charge fetch failed:", e)
+                shipping_cost = 0
 
         grand_total = cart_total + shipping_cost
 
@@ -518,7 +524,7 @@ async def save_order(request: Request):
         result = await db["orders"].insert_one(data)
 
         # Emails
-        customer_email = checkout.get("email")
+        customer_email = checkout.get("email") if isinstance(checkout, dict) else None
         if customer_email:
             send_order_email(customer_email, data, is_admin=False)
         if ADMIN_EMAIL:
@@ -535,7 +541,6 @@ async def save_order(request: Request):
     except Exception as e:
         print("❌ ERROR saving order:", e)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # =============================
 # Admin: View Orders (projection + sort)
