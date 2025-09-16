@@ -455,7 +455,9 @@ async def save_order(request: Request):
         # Order IDs
         myha_order_id = f"MYHA{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         data["orderId"] = myha_order_id
-        data["razorpayOrderId"] = data.get("orderId")
+        data["razorpayOrderId"] = data.get("razorpayOrderId")
+        data["razorpayPaymentId"] = data.get("razorpayPaymentId")
+
 
         # Timestamps
         now = iso_now()
