@@ -910,14 +910,13 @@ async def add_review(
 # =============================
 # shipment charge
 # =============================
-
 @app.get("/shipping-charge")
 async def get_shipping_charge(d_pin: str, weight: int = 500, pt: str = "Pre-paid"):
     params = {
         "md": "S",
         "ss": "Delivered",
         "d_pin": d_pin,
-        "o_pin": "603109",   # replace with your warehouse pincode
+        "o_pin": ORIGIN_PINCODE or "603109",
         "cgm": weight,
         "pt": pt
     }
@@ -937,7 +936,16 @@ async def get_shipping_charge(d_pin: str, weight: int = 500, pt: str = "Pre-paid
     if response.status_code != 200:
         raise HTTPException(status_code=500, detail="Failed to fetch shipping charges")
 
-    return response.json()
+    data = response.json()
+    print("📦 Raw shipping response:", data)
+
+    # ✅ Correct extraction from list
+    try:
+        amount = float(data[0].get("total_amount", 0)) if isinstance(data, list) and data else 0
+    except Exception:
+        amount = 0
+
+    return {"total_amount": amount}
 
 # =============================
 # Admin: Cancel Order
