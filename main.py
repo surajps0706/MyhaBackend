@@ -8,6 +8,9 @@ from models import Product
 from database import db
 from bson import ObjectId
 
+import sib_api_v3_sdk
+from sib_api_v3_sdk.rest import ApiException
+
 import razorpay
 import os
 import smtplib
@@ -34,6 +37,7 @@ load_dotenv()
 
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "myha-secret")
+BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
@@ -156,6 +160,7 @@ def send_order_email(to_email, order_data, is_admin=False):
         cart_items = order_data.get("cartItems", [])
         items_html = ""
 
+        # 🛒 Cart items table
         if cart_items:
             items_html += """
             <table style="width:100%; border-collapse:collapse; margin-top:20px; font-size:14px;">
@@ -215,7 +220,7 @@ def send_order_email(to_email, order_data, is_admin=False):
             total_amount = total_amount.replace("₹", "").replace(",", "").strip()
         total_amount = float(total_amount or 0)
 
-        # Greeting / Intro
+        # 👋 Greeting / Intro
         if is_admin:
             greeting = f"<h2 style='color:#000;'>🚨 New Order Alert</h2>"
             intro = f"<p>A new order <b>#{order_data.get('orderId')}</b> has been placed by <b>{checkout.get('name')}</b>.</p>"
@@ -223,7 +228,7 @@ def send_order_email(to_email, order_data, is_admin=False):
             greeting = f"<h2 style='color:#000;'>Thank you for shopping with <span style='color:#d63384;'>Myha Couture</span>, {checkout.get('name')}!</h2>"
             intro = f"<p>Your order <b>#{order_data.get('orderId')}</b> has been placed successfully. We’ll notify you once it is shipped.</p>"
 
-        # Shipping details block
+        # 📦 Shipping details
         shipping_html = f"""
         <div style="margin-top:20px; font-size:14px; line-height:1.5;">
           <h3 style="margin-bottom:8px;">📍 Shipping Details</h3>
@@ -238,6 +243,7 @@ def send_order_email(to_email, order_data, is_admin=False):
         </div>
         """
 
+        # 📧 Final HTML
         html = f"""
         <div style="font-family: Arial, sans-serif; color: #333; max-width: 650px; margin: auto; border:1px solid #eee; border-radius:8px; overflow:hidden;">
           <div style="background:#000; padding:20px; text-align:center;">
@@ -253,22 +259,27 @@ def send_order_email(to_email, order_data, is_admin=False):
         </div>
         """
 
-        msg = MIMEMultipart()
-        msg["From"] = f"Myha Couture <{EMAIL_FROM}>"
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(html, "html"))
+        # 🔑 Brevo Config
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
 
-        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.sendmail(EMAIL_FROM, to_email, msg.as_string())
+        # 📤 Build email object
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": to_email}],
+            sender={"name": "Myha Couture", "email": "myhacouture@gmail.com"},  # ✅ must match verified sender in Brevo
+            subject=subject,
+            html_content=html
+        )
 
-        print(f"✅ Order email sent to {to_email}")
+        # 🚀 Send email
+        response = api_instance.send_transac_email(send_smtp_email)
+        print(f"✅ Order email sent to {to_email}, messageId={response['messageId']}")
+
+    except ApiException as e:
+        print(f"❌ Brevo API error: {e}")
     except Exception as e:
-        print(f"❌ Failed to send email: {e}")
-
-
+        print(f"❌ Unexpected error in send_order_email: {e}")
 # =============================
 # ⭐ Delhivery Tracking Helper
 # =============================
