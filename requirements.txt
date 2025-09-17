@@ -10,3 +10,4 @@ openpyxl
 setuptools
 python-multipart
 httpx
+sib-api-v3-sdk
