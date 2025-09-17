@@ -150,7 +150,7 @@ def generate_order_id():
 # =============================
 def send_order_email(to_email, order_data, is_admin=False):
     try:
-        # Subject line
+        # 📌 Subject line
         if is_admin:
             subject = f"📦 New Order Received – Myha Couture #{order_data.get('orderId')}"
         else:
@@ -215,6 +215,7 @@ def send_order_email(to_email, order_data, is_admin=False):
                 """
             items_html += "</tbody></table>"
 
+        # 🧾 Total
         total_amount = order_data.get("totalAmount", 0)
         if isinstance(total_amount, str):
             total_amount = total_amount.replace("₹", "").replace(",", "").strip()
@@ -267,19 +268,22 @@ def send_order_email(to_email, order_data, is_admin=False):
         # 📤 Build email object
         send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
             to=[{"email": to_email}],
-            sender={"name": "Myha Couture", "email": "myhacouture@gmail.com"},  # ✅ must match verified sender in Brevo
+            sender={"name": "Myha Couture", "email": "order@myhacouture.com"},  # must match verified sender
             subject=subject,
             html_content=html
         )
 
         # 🚀 Send email
         response = api_instance.send_transac_email(send_smtp_email)
-        print(f"✅ Order email sent to {to_email}, messageId={response['messageId']}")
+        print(f"✅ Order email sent to {to_email}, messageId={response.message_id}")
 
     except ApiException as e:
         print(f"❌ Brevo API error: {e}")
     except Exception as e:
         print(f"❌ Unexpected error in send_order_email: {e}")
+
+
+        
 # =============================
 # ⭐ Delhivery Tracking Helper
 # =============================
