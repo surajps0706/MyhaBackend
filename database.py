@@ -20,25 +20,30 @@ db = client["myha"]
 # ==============================
 # ORDER ID AUTO-INCREMENT LOGIC
 # ==============================
-
-async def get_next_order_id():
+async def get_next_order_id() -> int:
     """
     Fetches the next sequential order ID.
     Starts from 999990632 and increments by 1 for each new order.
+    Auto-creates counter document if missing.
     """
-    counter = await db.counters.find_one_and_update(
+    counters = db["counters"]
+
+    # increment (or create)
+    result = await counters.find_one_and_update(
         {"_id": "orderid"},
         {"$inc": {"sequence_value": 1}},
-        upsert=True,  # create if not exists
+        upsert=True,
         return_document=True
     )
 
-    # If this is the very first order (document just created)
-    if "sequence_value" not in counter:
-        await db.counters.update_one(
+    # 🧠 Handle first-time creation (result will be None)
+    if not result or "sequence_value" not in result:
+        await counters.update_one(
             {"_id": "orderid"},
-            {"$set": {"sequence_value": 999990632}}
+            {"$set": {"sequence_value": 999990632}},
+            upsert=True
         )
-        return 999990632
+        # fetch again (recursive call ensures correct next value)
+        return await get_next_order_id()
 
-    return counter["sequence_value"]
+    return int(result["sequence_value"])
