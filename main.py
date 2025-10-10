@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 
 from models import Product
-from database import db
+from database import db, get_next_order_id
 from bson import ObjectId
 
 import sib_api_v3_sdk
@@ -406,30 +406,75 @@ async def upload_product(
 # =============================
 # Razorpay Order Creation
 # =============================
+from fastapi import Request, HTTPException
+from fastapi.responses import JSONResponse
+from database import db, get_next_order_id  # ✅ make sure this import exists
+import httpx
+
 @app.post("/create-order")
 async def create_order(request: Request):
-    data = await request.json()
-    amount = data.get("amount")
-    currency = data.get("currency", "INR")
-    receipt = data.get("receipt", "receipt_order_123")
-    notes = data.get("notes", {})
-
-    if not amount:
-        return JSONResponse(status_code=400, content={"error": "Amount is required"})
-
+    """Creates a new Razorpay order and assigns a sequential Myha order ID."""
     try:
+        data = await request.json()
+        amount = data.get("amount")
+        currency = data.get("currency", "INR")
+        notes = data.get("notes", {})
+        destination_pincode = data.get("destination_pincode")
+
+        if not amount:
+            return JSONResponse(status_code=400, content={"error": "Amount is required"})
+
+        # ✅ Step 1: Generate next sequential order ID
+        order_id = await get_next_order_id()
+
+        # ✅ Step 2: (Optional) Fetch shipping charge from Delhivery
+        shipping_charge = 0
+        if destination_pincode:
+            try:
+                shipping_charge = await fetch_shipping_charge(destination_pincode)
+            except Exception as e:
+                print(f"⚠️ Failed to fetch shipping charge: {e}")
+                shipping_charge = 0
+
+        # ✅ Step 3: Create Razorpay order (use order_id in receipt for traceability)
         razorpay_order = razorpay_client.order.create({
-            "amount": int(float(amount) * 100),
+            "amount": int(float(amount) * 100),  # Razorpay expects amount in paise
             "currency": currency,
-            "receipt": receipt,
+            "receipt": f"MYHA{order_id}",
             "notes": notes
         })
-        return razorpay_order
+
+        # ✅ Step 4: Save minimal record in MongoDB
+        order_record = {
+            "orderId": order_id,
+            "razorpayOrderId": razorpay_order.get("id"),
+            "amount": amount,
+            "currency": currency,
+            "shippingCost": shipping_charge,
+            "status": "Created",
+            "createdAt": iso_now()
+        }
+        await db["orders"].insert_one(order_record)
+
+        # ✅ Step 5: Return full response to frontend
+        return {
+            "success": True,
+            "message": "Order created successfully",
+            "orderId": order_id,
+            "razorpay_order": razorpay_order,
+            "shippingCharge": shipping_charge
+        }
+
     except Exception as e:
+        print(f"❌ Error creating order: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+
+# ===================================================
+# Helper: Delhivery Shipping Charge Fetch
+# ===================================================
 async def fetch_shipping_charge(destination_pincode: str, weight: int = 500, pt: str = "Pre-paid"):
-    """Call Delhivery API to get shipping charge."""
+    """Fetch live shipping cost from Delhivery API."""
     params = {
         "md": "E",
         "ss": "Delivered",
@@ -443,7 +488,7 @@ async def fetch_shipping_charge(destination_pincode: str, weight: int = 500, pt:
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(
             f"{DELHIVERY_BASE_URL}/api/kinko/v1/invoice/charges/.json",
             params=params,
@@ -454,32 +499,43 @@ async def fetch_shipping_charge(destination_pincode: str, weight: int = 500, pt:
         raise HTTPException(status_code=500, detail="Failed to fetch shipping charges")
 
     data = response.json()
-    return data.get("total_amount", 0)  # adjust if Delhivery uses another key
 
-
+    # Some Delhivery accounts return a list; handle both formats
+    if isinstance(data, list) and data:
+        return float(data[0].get("total_amount", 0))
+    elif isinstance(data, dict):
+        return float(data.get("total_amount", 0))
+    return 0.0
 
 
 # =============================
 # Save Order & Send Email
 # (Normalized cartItems + ISO timestamps)
 # =============================
+from database import db, get_next_order_id  # ✅ ensure this import is at the top
+
 @app.post("/save-order")
 async def save_order(request: Request):
     data = await request.json()
     try:
-        # Order IDs
-        myha_order_id = f"MYHA{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        # ✅ 1. Order ID logic
+        # If frontend already passes an orderId (from /create-order), use it.
+        # Else, generate a new sequential one.
+        myha_order_id = data.get("orderId")
+        if not myha_order_id:
+            myha_order_id = await get_next_order_id()
+
         data["orderId"] = myha_order_id
         data["razorpayOrderId"] = data.get("razorpayOrderId")
         data["razorpayPaymentId"] = data.get("razorpayPaymentId")
 
-        # Timestamps
+        # ✅ 2. Status + timestamps
         now = iso_now()
         data["status"] = "Preparing"
         data["createdAt"] = now
         data["statusTimeline"] = {"Preparing": now}
 
-        # Normalize cart items
+        # ✅ 3. Normalize cart items
         normalized_items = []
         for it in data.get("cartItems", []):
             price = it.get("price", 0)
@@ -512,10 +568,10 @@ async def save_order(request: Request):
         if normalized_items:
             data["cartItems"] = normalized_items
 
-        # 🔹 Calculate totals
+        # ✅ 4. Calculate totals
         cart_total = sum(it["lineTotal"] for it in normalized_items)
 
-        # Get shipping cost (based on checkoutData.pincode)
+        # ✅ 5. Get shipping charge
         checkout = data.get("checkoutData") or {}
         if isinstance(checkout, list):
             checkout = checkout[0] if checkout else {}
@@ -535,16 +591,17 @@ async def save_order(request: Request):
         data["shippingCost"] = shipping_cost
         data["grandTotal"] = grand_total
 
-        # Save into DB
+        # ✅ 6. Save final order in MongoDB
         result = await db["orders"].insert_one(data)
 
-        # Emails
+        # ✅ 7. Send order confirmation emails
         customer_email = checkout.get("email") if isinstance(checkout, dict) else None
         if customer_email:
             send_order_email(customer_email, data, is_admin=False)
         if ADMIN_EMAIL:
             send_order_email(ADMIN_EMAIL, data, is_admin=True)
 
+        # ✅ 8. Response
         return {
             "message": "Order saved",
             "id": str(result.inserted_id),
