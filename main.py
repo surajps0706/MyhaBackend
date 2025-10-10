@@ -547,7 +547,8 @@ async def save_order(request: Request):
             sleeve_price = float(it.get("sleevePrice", 0) or 0)
             height_price = float(it.get("extraHeightPrice", 0) or 0)
 
-            line_total = (price + sleeve_price + height_price) * qty
+            bust_price = float(it.get("bustExtra", 0) or 0)
+            line_total = (price + sleeve_price + height_price + bust_price) * qty
 
             normalized_items.append({
                 "productId": it.get("productId") or it.get("_id"),
