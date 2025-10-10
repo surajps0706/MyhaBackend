@@ -12,6 +12,8 @@ class Product(BaseModel):
     selectedColor: str
     images: List[str]
     category: Optional[str] = "kurta"
+    isSoldOut: Optional[bool] = False   # 🆕 Added line
+
 
 # ----------------- NEW CODE -----------------
 class TimelineEntry(BaseModel):
