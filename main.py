@@ -441,7 +441,8 @@ async def create_order(request: Request):
             "amount": int(float(amount) * 100),  # Razorpay expects amount in paise
             "currency": currency,
             "receipt": f"MYHA{order_id}",
-            "notes": notes
+            "notes": notes,
+            "payment_capture": 1
         })
 
         # ✅ Step 4: Save minimal record in MongoDB
