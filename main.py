@@ -509,8 +509,6 @@ async def save_order(request: Request):
     data = await request.json()
     try:
         # ✅ 1. Order ID logic
-        # If frontend already passes an orderId (from /create-order), use it.
-        # Else, generate a new sequential one.
         myha_order_id = data.get("orderId")
         if not myha_order_id:
             myha_order_id = await get_next_order_id()
@@ -547,10 +545,22 @@ async def save_order(request: Request):
                 "price": price,
                 "quantity": qty,
                 "selectedSize": it.get("selectedSize"),
+
+                # ✅ Sleeve customization
                 "sleeveType": it.get("sleeveType"),
                 "sleevePrice": sleeve_price,
+
+                # ✅ Height customization (store actual text/value)
                 "preferredHeight": it.get("preferredHeight"),
                 "extraHeightPrice": height_price,
+
+                # ✅ Neck customization (store typed text)
+                "neckCustomization": it.get("neckCustomization", None),
+
+                # ✅ Optional bust size adjustment
+                "bustExtra": float(it.get("bustExtra", 0) or 0),
+
+                # ✅ Calculated totals + notes
                 "lineTotal": line_total,
                 "measurements": it.get("measurements", {}),
                 "customizationNotes": it.get("customizationNotes", "")
@@ -562,7 +572,7 @@ async def save_order(request: Request):
         # ✅ 4. Calculate totals
         cart_total = sum(it["lineTotal"] for it in normalized_items)
 
-        # ✅ 5. Get shipping charge
+        # ✅ 5. Fetch shipping charge
         checkout = data.get("checkoutData") or {}
         if isinstance(checkout, list):
             checkout = checkout[0] if checkout else {}
@@ -582,29 +592,23 @@ async def save_order(request: Request):
         data["shippingCost"] = shipping_cost
         data["grandTotal"] = grand_total
 
-        # ✅ 6. Save final order in MongoDB (update if exists)
+        # ✅ 6. Save order (update existing or insert new)
         existing = await db["orders"].find_one({"orderId": data["orderId"]})
-
         if existing:
-            # Update the stub record created by /create-order
-            await db["orders"].update_one(
-                {"orderId": data["orderId"]},
-                {"$set": data}
-            )
+            await db["orders"].update_one({"orderId": data["orderId"]}, {"$set": data})
             result_id = existing["_id"]
         else:
-            # Fallback: insert new record if none exists
             insert_result = await db["orders"].insert_one(data)
             result_id = insert_result.inserted_id
 
-        # ✅ 7. Send order confirmation emails
+        # ✅ 7. Send confirmation emails
         customer_email = checkout.get("email") if isinstance(checkout, dict) else None
         if customer_email:
             send_order_email(customer_email, data, is_admin=False)
         if ADMIN_EMAIL:
             send_order_email(ADMIN_EMAIL, data, is_admin=True)
 
-        # ✅ 8. Response
+        # ✅ 8. Final response
         return {
             "message": "Order saved",
             "id": str(result_id),
@@ -616,6 +620,7 @@ async def save_order(request: Request):
     except Exception as e:
         print("❌ ERROR saving order:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # =============================
 # Admin: View Orders (projection + sort)
