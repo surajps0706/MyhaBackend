@@ -413,7 +413,7 @@ import httpx
 
 @app.post("/create-order")
 async def create_order(request: Request):
-    """Creates a new Razorpay order and assigns a sequential Myha order ID."""
+    """Creates a new Razorpay order and assigns a sequential Myha order ID — without inserting in DB yet."""
     try:
         data = await request.json()
         amount = data.get("amount")
@@ -445,19 +445,9 @@ async def create_order(request: Request):
             "payment_capture": 1
         })
 
-        # ✅ Step 4: Save minimal record in MongoDB
-        order_record = {
-            "orderId": order_id,
-            "razorpayOrderId": razorpay_order.get("id"),
-            "amount": amount,
-            "currency": currency,
-            "shippingCost": shipping_charge,
-            "status": "Created",
-            "createdAt": iso_now()
-        }
-        await db["orders"].insert_one(order_record)
+        # ⚠️ Removed DB insert here — we only save after payment success via /save-order
 
-        # ✅ Step 5: Return full response to frontend
+        # ✅ Step 4: Return response to frontend
         return {
             "success": True,
             "message": "Order created successfully",
@@ -469,7 +459,6 @@ async def create_order(request: Request):
     except Exception as e:
         print(f"❌ Error creating order: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
-
 
 # ===================================================
 # Helper: Delhivery Shipping Charge Fetch
