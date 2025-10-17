@@ -547,8 +547,8 @@ async def save_order(request: Request):
             qty = int(it.get("quantity", 1))
             sleeve_price = float(it.get("sleevePrice", 0) or 0)
             height_price = float(it.get("extraHeightPrice", 0) or 0)
-
             bust_price = float(it.get("bustExtra", 0) or 0)
+
             line_total = (price + sleeve_price + height_price + bust_price) * qty
 
             normalized_items.append({
@@ -593,8 +593,20 @@ async def save_order(request: Request):
         data["shippingCost"] = shipping_cost
         data["grandTotal"] = grand_total
 
-        # ✅ 6. Save final order in MongoDB
-        result = await db["orders"].insert_one(data)
+        # ✅ 6. Save final order in MongoDB (update if exists)
+        existing = await db["orders"].find_one({"orderId": data["orderId"]})
+
+        if existing:
+            # Update the stub record created by /create-order
+            await db["orders"].update_one(
+                {"orderId": data["orderId"]},
+                {"$set": data}
+            )
+            result_id = existing["_id"]
+        else:
+            # Fallback: insert new record if none exists
+            insert_result = await db["orders"].insert_one(data)
+            result_id = insert_result.inserted_id
 
         # ✅ 7. Send order confirmation emails
         customer_email = checkout.get("email") if isinstance(checkout, dict) else None
@@ -606,7 +618,7 @@ async def save_order(request: Request):
         # ✅ 8. Response
         return {
             "message": "Order saved",
-            "id": str(result.inserted_id),
+            "id": str(result_id),
             "orderId": myha_order_id,
             "shippingCost": shipping_cost,
             "grandTotal": grand_total
@@ -853,18 +865,32 @@ async def update_product(product_id: str, request: Request, authorization: str =
     return {"message": "Product updated"}
 
 
-# =============================
-# Get Single Order by ID (Admin, secured)
-# =============================
 @app.get("/orders/{order_id}")
 async def get_order(order_id: str, authorization: str = Header(None)):
     if authorization != f"Bearer {ADMIN_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    order = await db["orders"].find_one({"orderId": order_id}, {"_id": 0})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    return order
+    try:
+        # 🔍 Try matching string orderId first
+        order = await db["orders"].find_one({"orderId": order_id}, {"_id": 0})
+
+        # 🔁 If not found, try converting to int and match again
+        if not order:
+            try:
+                numeric_id = int(order_id)
+                order = await db["orders"].find_one({"orderId": numeric_id}, {"_id": 0})
+            except ValueError:
+                pass  # order_id wasn't numeric, skip
+
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        return order
+
+    except Exception as e:
+        print(f"❌ Error fetching order details for {order_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # =============================
