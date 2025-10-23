@@ -519,9 +519,9 @@ async def save_order(request: Request):
 
         # ✅ 2. Status + timestamps
         now = iso_now()
-        data["status"] = "Preparing"
+        data["status"] = "Ordered"
         data["createdAt"] = now
-        data["statusTimeline"] = {"Preparing": now}
+        data["statusTimeline"] = {"Ordered": now}
 
         # ✅ 3. Normalize cart items
         normalized_items = []
@@ -659,11 +659,20 @@ async def update_order_status(order_id: str, request: Request, authorization: st
     data = await request.json()
     new_status = data.get("status")
 
-    valid_statuses = ["Preparing", "Packed", "Shipped", "Delivered", "Cancelled"]
+    valid_statuses = ["Ordered", "Preparing", "Packed", "Shipped", "Delivered", "Cancelled"]
     if new_status not in valid_statuses:
         raise HTTPException(status_code=400, detail="Invalid status")
 
     order = await db["orders"].find_one({"orderId": order_id})
+
+    if not order:
+        try:
+            numeric_id = int(order_id)
+            order = await db["orders"].find_one({"orderId": numeric_id})
+        except ValueError:
+            pass  # if it can't be converted, skip
+
+
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -894,21 +903,30 @@ async def get_order(order_id: str, authorization: str = Header(None)):
 async def track_order(request: Request):
     data = await request.json()
     order_id = data.get("orderId")
-    email = data.get("email")
 
-    if not order_id or not email:
-        raise HTTPException(status_code=400, detail="Order ID and email required")
+    if not order_id:
+        raise HTTPException(status_code=400, detail="Order ID is required")
 
     try:
-        order = await db["orders"].find_one({
-            "orderId": order_id,
-            "checkoutData.email": email
-        })
+        # try finding order by string id first
+        order = await db["orders"].find_one({"orderId": order_id})
+
+        # fallback for numeric order IDs stored as int
         if not order:
-            raise HTTPException(status_code=404, detail="No order found with provided details")
+            try:
+                numeric_id = int(order_id)
+                order = await db["orders"].find_one({"orderId": numeric_id})
+            except ValueError:
+                pass  # ignore if conversion fails
+
+        if not order:
+            raise HTTPException(status_code=404, detail="No order found with the provided Order ID")
+
         return fix_id(order)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Error tracking order {order_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 @app.post("/add-product-url")

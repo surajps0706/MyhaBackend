@@ -2,6 +2,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 from dotenv import load_dotenv
 import ssl
+from datetime import datetime
 
 load_dotenv()
 
@@ -20,30 +21,24 @@ db = client["myha"]
 # ==============================
 # ORDER ID AUTO-INCREMENT LOGIC
 # ==============================
-async def get_next_order_id() -> int:
+async def get_next_order_id() -> str:
     """
-    Fetches the next sequential order ID.
-    Starts from 999990632 and increments by 1 for each new order.
-    Auto-creates counter document if missing.
+    Generates daily Myha order IDs like MYHA2310251 (MYHA + DDMMYY + counter).
+    Counter resets every new day.
     """
     counters = db["counters"]
+    now = datetime.now()
+    date_part = now.strftime("%d%m%y")  # 231025 for 23 Oct 2025
+    prefix = f"MYHA{date_part}"
 
-    # increment (or create)
-    result = await counters.find_one_and_update(
-        {"_id": "orderid"},
-        {"$inc": {"sequence_value": 1}},
-        upsert=True,
-        return_document=True
-    )
+    # find today’s counter
+    record = await counters.find_one({"_id": prefix})
 
-    # 🧠 Handle first-time creation (result will be None)
-    if not result or "sequence_value" not in result:
-        await counters.update_one(
-            {"_id": "orderid"},
-            {"$set": {"sequence_value": 999990632}},
-            upsert=True
-        )
-        # fetch again (recursive call ensures correct next value)
-        return await get_next_order_id()
+    if record:
+        next_num = record.get("sequence_value", 0) + 1
+        await counters.update_one({"_id": prefix}, {"$set": {"sequence_value": next_num}})
+    else:
+        next_num = 1
+        await counters.insert_one({"_id": prefix, "sequence_value": next_num})
 
-    return int(result["sequence_value"])
+    return f"{prefix}{next_num}"
