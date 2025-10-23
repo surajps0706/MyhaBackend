@@ -663,86 +663,90 @@ async def update_order_status(order_id: str, request: Request, authorization: st
     if new_status not in valid_statuses:
         raise HTTPException(status_code=400, detail="Invalid status")
 
+    # ✅ find order by string or numeric orderId
     order = await db["orders"].find_one({"orderId": order_id})
-
     if not order:
         try:
             numeric_id = int(order_id)
             order = await db["orders"].find_one({"orderId": numeric_id})
         except ValueError:
-            pass  # if it can't be converted, skip
-
-
+            pass
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    # ✅ update timeline
     status_timeline = order.get("statusTimeline", {})
     status_timeline[new_status] = iso_now()
-
     update_data: Dict[str, Any] = {"status": new_status, "statusTimeline": status_timeline}
 
     # ⭐ Shipment creation when Packed
     if new_status == "Packed" and not order.get("awb"):
-        shipment_payload = {
-            "shipments": [
-                {
-                    "name": order["checkoutData"].get("name", "Unknown"),
-                    "add": order["checkoutData"].get("address", order["checkoutData"].get("addressLine1", "Not Provided")),
-                    "pin": order["checkoutData"].get("pincode", ""),
-                    "city": order["checkoutData"].get("city", "Chennai"),
-                    "state": order["checkoutData"].get("state", "Tamil Nadu"),
-                    "country": "India",
-                    "phone": order["checkoutData"].get("phone", ""),
-                    "order": order["orderId"],
-                    "payment_mode": "Prepaid" if order.get("paymentType") == "Prepaid" else "COD",
-                    "cod_amount": float(order.get("totalAmount", 0)) if order.get("paymentType") == "COD" else 0,
-                    "total_amount": float(order.get("totalAmount", 0) or 0),
-                    "products_desc": ", ".join([p.get("name", "") for p in order.get("cartItems", [])]),
-                    "quantity": len(order.get("cartItems", [])),
-                    "weight": 0.5,
-                    "shipment_width": "20",
-                    "shipment_height": "5",
-                    "shipping_mode": "Surface",
-                    "return_add": "Myha Return Address",
-                    "return_pin": "600002",
-                    "return_city": "Chennai",
-                    "return_state": "Tamil Nadu",
-                    "return_country": "India",
-                    "return_phone": "9876543210"
-                }
-            ],
-            "pickup_location": {"name": "Myha"}
-        }
+        checkout = order.get("checkoutData") or {}
 
-        headers = {
-            "Authorization": f"Token {DELHIVERY_API_TOKEN}",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json"
-        }
+        # handle cases where checkoutData is a list
+        if isinstance(checkout, list) and checkout:
+            checkout = checkout[0]
 
         try:
+            shipment_payload = {
+                "shipments": [
+                    {
+                        "name": checkout.get("name", "Unknown"),
+                        "add": checkout.get("address", checkout.get("addressLine1", "Not Provided")),
+                        "pin": checkout.get("pincode", ""),
+                        "city": checkout.get("city", "Chennai"),
+                        "state": checkout.get("state", "Tamil Nadu"),
+                        "country": "India",
+                        "phone": checkout.get("phone", ""),
+                        "order": order["orderId"],
+                        "payment_mode": "Prepaid" if order.get("paymentType") == "Prepaid" else "COD",
+                        "cod_amount": float(order.get("totalAmount", 0)) if order.get("paymentType") == "COD" else 0,
+                        "total_amount": float(order.get("totalAmount", 0) or 0),
+                        "products_desc": ", ".join([p.get("name", "") for p in order.get("cartItems", [])]),
+                        "quantity": len(order.get("cartItems", [])),
+                        "weight": 0.5,
+                        "shipment_width": "20",
+                        "shipment_height": "5",
+                        "shipping_mode": "Surface",
+                        "return_add": "Myha Return Address",
+                        "return_pin": "600002",
+                        "return_city": "Chennai",
+                        "return_state": "Tamil Nadu",
+                        "return_country": "India",
+                        "return_phone": "9876543210"
+                    }
+                ],
+                "pickup_location": {"name": "Myha"}
+            }
+
+            headers = {
+                "Authorization": f"Token {DELHIVERY_API_TOKEN}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json"
+            }
+
             async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.post(
                     f"{DELHIVERY_BASE_URL}/api/cmu/create.json",
                     headers=headers,
                     data={"format": "json", "data": json.dumps(shipment_payload)}
                 )
-            data = resp.json()
-            print("📦 Delhivery Response:", data)
 
-            if "packages" in data and data["packages"]:
-                awb = data["packages"][0]["waybill"]
-                update_data["awb"] = awb
+            data_resp = resp.json()
+            print("📦 Delhivery Response:", data_resp)
+
+            if "packages" in data_resp and data_resp["packages"]:
+                awb = data_resp["packages"][0].get("waybill")
+                update_data["awb"] = awb or f"DUMMY{random.randint(100000,999999)}"
             else:
-                dummy_awb = f"DUMMY{random.randint(100000,999999)}"
-                update_data["awb"] = dummy_awb
+                update_data["awb"] = f"DUMMY{random.randint(100000,999999)}"
+
         except Exception as e:
             print(f"❌ Delhivery Shipment creation error: {e}")
-            dummy_awb = f"DUMMY{random.randint(100000,999999)}"
-            update_data["awb"] = dummy_awb
+            update_data["awb"] = f"DUMMY{random.randint(100000,999999)}"
 
+    # ✅ commit update
     result = await db["orders"].update_one({"orderId": order_id}, {"$set": update_data})
-
     if result.modified_count == 0:
         raise HTTPException(status_code=500, detail="Failed to update status")
 
@@ -753,7 +757,6 @@ async def update_order_status(order_id: str, request: Request, authorization: st
         "statusTimeline": status_timeline,
         "awb": update_data.get("awb", order.get("awb"))
     }
-
 
 # =============================
 # ⭐ Unified Timeline Endpoint
