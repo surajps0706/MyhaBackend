@@ -145,6 +145,22 @@ def generate_order_id():
     return f"MYHA{now.strftime('%Y%m%d%H%M%S')}{random.randint(100,999)}"
 
 
+
+#delete
+# ================
+
+@app.delete("/delete-order/{order_id}")
+async def delete_order(order_id: str):
+    try:
+        result = await db.orders.delete_one({"orderId": order_id})
+        if result.deleted_count == 1:
+            return {"success": True, "message": f"Order {order_id} deleted successfully"}
+        else:
+            raise HTTPException(status_code=404, detail="Order not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # =============================
 # Send Email (Order Confirmation with Shipping + Product Images)
 # =============================
