@@ -350,7 +350,7 @@ async def fetch_delhivery_tracking(awb: str):
 @app.get("/products")
 async def get_products():
     try:
-        products_cursor = db["products"].find()
+        products_cursor = db["products"].find().sort([("displayOrder", 1), ("createdAt", -1)])
         products = []
         async for product in products_cursor:
             products.append(fix_id(product))
@@ -662,6 +662,40 @@ async def get_orders(authorization: str = Header(None)):
 
     orders = [o async for o in cursor]
     return orders
+
+
+
+#drag and drop
+# ==================
+
+@app.post("/update-order")
+async def update_order(request: Request):
+    """
+    Accepts a list of { _id, displayOrder } from the admin frontend
+    and updates each product’s displayOrder in MongoDB.
+    """
+    try:
+        data = await request.json()  # list of dicts
+        if not isinstance(data, list):
+            return {"error": "Invalid payload format. Expected a list."}
+
+        # Update each product individually
+        for item in data:
+            _id = item.get("_id")
+            order = item.get("displayOrder", 0)
+            if not _id:
+                continue
+            await db["products"].update_one(
+                {"_id": ObjectId(_id)},
+                {"$set": {"displayOrder": order}}
+            )
+
+        return {"message": "✅ Product order updated successfully"}
+
+    except Exception as e:
+        print("🔥 Error updating order:", e)
+        return {"error": str(e)}
+
 
 
 # =============================

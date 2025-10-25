@@ -13,6 +13,8 @@ class Product(BaseModel):
     images: List[str]
     category: Optional[str] = "kurta"
     isSoldOut: Optional[bool] = False   # 🆕 Added line
+    displayOrder: Optional[int] = 0
+
 
 
 # ----------------- NEW CODE -----------------
