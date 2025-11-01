@@ -33,6 +33,31 @@ import json    # ⭐ for payload formatting
 # =============================
 load_dotenv()
 
+
+def config_cloudinary(use_new=False):
+    """Switch between old and new Cloudinary accounts."""
+    if use_new:
+        cloudinary.config(
+            cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME_NEW"),
+            api_key=os.getenv("CLOUDINARY_API_KEY_NEW"),
+            api_secret=os.getenv("CLOUDINARY_API_SECRET_NEW"),
+            secure=True
+        )
+    else:
+        cloudinary.config(
+            cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+            api_key=os.getenv("CLOUDINARY_API_KEY"),
+            api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+            secure=True
+        )
+
+def upload_image(file, folder="products", use_new=False):
+    """Upload to whichever Cloudinary account you choose."""
+    config_cloudinary(use_new)
+    result = cloudinary.uploader.upload(file, folder=folder)
+    return result["secure_url"]
+
+
 # router = APIRouter()
 
 
@@ -60,12 +85,12 @@ ORIGIN_PINCODE = os.getenv("ORIGIN_PINCODE")
 
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
-cloudinary.config(
-    cloud_name=CLOUDINARY_CLOUD_NAME,
-    api_key=CLOUDINARY_API_KEY,
-    api_secret=CLOUDINARY_API_SECRET,
-    secure=True
-)
+# cloudinary.config(
+#     cloud_name=CLOUDINARY_CLOUD_NAME,
+#     api_key=CLOUDINARY_API_KEY,
+#     api_secret=CLOUDINARY_API_SECRET,
+#     secure=True
+# )
 
 app = FastAPI()
 # app.include_router(router, prefix="") 
@@ -399,8 +424,9 @@ async def upload_product(
         image_urls = []
         if images:
             for img in images:
-                upload_result = cloudinary.uploader.upload(img.file)
-                image_urls.append(upload_result["secure_url"])
+                image_urls.append(upload_image(img.file, use_new=True))
+                # upload_result = cloudinary.uploader.upload(img.file)
+                # image_urls.append(upload_result["secure_url"])
 
         product_data = {
             "name": name,
