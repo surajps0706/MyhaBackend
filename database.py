@@ -21,24 +21,25 @@ db = client["myha"]
 # ==============================
 # ORDER ID AUTO-INCREMENT LOGIC
 # ==============================
+from datetime import datetime
+from . import db  # adjust if needed
+
 async def get_next_order_id() -> str:
     """
-    Generates daily Myha order IDs like MYHA2310251 (MYHA + DDMMYY + counter).
-    Counter resets every new day.
+    Generates order IDs like 04112501, 04112502, ...
+    Date (DDMMYY) updates daily, but counter continues globally.
     """
     counters = db["counters"]
     now = datetime.now()
-    date_part = now.strftime("%d%m%y")  # 231025 for 23 Oct 2025
-    prefix = f"MYHA{date_part}"
+    date_part = now.strftime("%d%m%y")  # e.g., 041125
 
-    # find today’s counter
-    record = await counters.find_one({"_id": prefix})
+    # single global counter document
+    record = await counters.find_one_and_update(
+        {"_id": "global_order_counter"},
+        {"$inc": {"sequence_value": 1}},
+        upsert=True,
+        return_document=True
+    )
 
-    if record:
-        next_num = record.get("sequence_value", 0) + 1
-        await counters.update_one({"_id": prefix}, {"$set": {"sequence_value": next_num}})
-    else:
-        next_num = 1
-        await counters.insert_one({"_id": prefix, "sequence_value": next_num})
-
-    return f"{prefix}{next_num}"
+    next_num = record["sequence_value"]
+    return f"{date_part}{next_num:02d}"
