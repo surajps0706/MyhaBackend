@@ -21,9 +21,6 @@ db = client["myha"]
 # ==============================
 # ORDER ID AUTO-INCREMENT LOGIC
 # ==============================
-from datetime import datetime
-from . import db  # adjust if needed
-
 async def get_next_order_id() -> str:
     """
     Generates order IDs like 04112501, 04112502, ...
