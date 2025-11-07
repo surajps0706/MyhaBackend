@@ -23,19 +23,21 @@ db = client["myha"]
 # ==============================
 async def get_next_order_id() -> str:
     """
-    Generates order IDs like 04112501, 04112502, ...
-    Date (DDMMYY) updates daily, but counter continues globally.
+    Generates order IDs like:
+    07112522, 08112523, 09112524, ...
+    Date (DDMMYY) updates daily,
+    but the counter continues globally.
     """
     counters = db["counters"]
     now = datetime.now()
-    date_part = now.strftime("%d%m%y")  # e.g., 041125
+    date_part = now.strftime("%d%m%y")  # today's date (DDMMYY)
 
-    # single global counter document
+    # Atomically increment and return updated counter value
     record = await counters.find_one_and_update(
         {"_id": "global_order_counter"},
         {"$inc": {"sequence_value": 1}},
         upsert=True,
-        return_document=True
+        return_document=ReturnDocument.AFTER  # ensures we get the incremented value
     )
 
     next_num = record["sequence_value"]
