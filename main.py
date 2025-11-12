@@ -34,16 +34,34 @@ import json    # ⭐ for payload formatting
 load_dotenv()
 
 
-def config_cloudinary(use_new=False):
-    """Switch between old and new Cloudinary accounts."""
-    if use_new:
+def config_cloudinary(account="old"):
+    """Switch between Cloudinary accounts (4 total supported)."""
+
+    if account == "split1":  # 🔹 New Account for first 10 products
+        cloudinary.config(
+            cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME_SPLIT1"),
+            api_key=os.getenv("CLOUDINARY_API_KEY_SPLIT1"),
+            api_secret=os.getenv("CLOUDINARY_API_SECRET_SPLIT1"),
+            secure=True
+        )
+
+    elif account == "split2":  # 🔹 New Account for next 13 products
+        cloudinary.config(
+            cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME_SPLIT2"),
+            api_key=os.getenv("CLOUDINARY_API_KEY_SPLIT2"),
+            api_secret=os.getenv("CLOUDINARY_API_SECRET_SPLIT2"),
+            secure=True
+        )
+
+    elif account == "new":  # 🔹 Your 3rd account — for all *future uploads*
         cloudinary.config(
             cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME_NEW"),
             api_key=os.getenv("CLOUDINARY_API_KEY_NEW"),
             api_secret=os.getenv("CLOUDINARY_API_SECRET_NEW"),
             secure=True
         )
-    else:
+
+    else:  # 🔹 Old account (23 products, quota full)
         cloudinary.config(
             cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
             api_key=os.getenv("CLOUDINARY_API_KEY"),
@@ -51,11 +69,13 @@ def config_cloudinary(use_new=False):
             secure=True
         )
 
-def upload_image(file, folder="products", use_new=False):
-    """Upload to whichever Cloudinary account you choose."""
-    config_cloudinary(use_new)
+
+def upload_image(file, folder="products", account="old"):
+    """Upload to the chosen Cloudinary account."""
+    config_cloudinary(account)
     result = cloudinary.uploader.upload(file, folder=folder)
     return result["secure_url"]
+
 
 
 # router = APIRouter()
@@ -758,8 +778,6 @@ async def update_order_status(order_id: str, request: Request, authorization: st
     # ⭐ Shipment creation when Packed
     if new_status == "Packed" and not order.get("awb"):
         checkout = order.get("checkoutData") or {}
-
-        # handle cases where checkoutData is a list
         if isinstance(checkout, list) and checkout:
             checkout = checkout[0]
 
@@ -801,7 +819,8 @@ async def update_order_status(order_id: str, request: Request, authorization: st
                 "Accept": "application/json"
             }
 
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            # === first attempt ===
+            async with httpx.AsyncClient(timeout=40.0) as client:
                 resp = await client.post(
                     f"{DELHIVERY_BASE_URL}/api/cmu/create.json",
                     headers=headers,
@@ -811,15 +830,45 @@ async def update_order_status(order_id: str, request: Request, authorization: st
             data_resp = resp.json()
             print("📦 Delhivery Response:", data_resp)
 
-            if "packages" in data_resp and data_resp["packages"]:
-                awb = data_resp["packages"][0].get("waybill")
-                update_data["awb"] = awb or f"DUMMY{random.randint(100000,999999)}"
+            awb = None
+            if (
+                resp.status_code == 200
+                and "packages" in data_resp
+                and data_resp["packages"]
+                and data_resp["packages"][0].get("waybill")
+            ):
+                awb = data_resp["packages"][0]["waybill"]
+
+            # === retry once if AWB missing ===
+            if not awb:
+                print(f"⚠️ AWB missing for {order_id}, retrying once...")
+                await asyncio.sleep(2)
+                async with httpx.AsyncClient(timeout=40.0) as client:
+                    retry_resp = await client.post(
+                        f"{DELHIVERY_BASE_URL}/api/cmu/create.json",
+                        headers=headers,
+                        data={"format": "json", "data": json.dumps(shipment_payload)}
+                    )
+                retry_data = retry_resp.json()
+                print("📦 Retry Response:", retry_data)
+                if (
+                    retry_resp.status_code == 200
+                    and "packages" in retry_data
+                    and retry_data["packages"]
+                    and retry_data["packages"][0].get("waybill")
+                ):
+                    awb = retry_data["packages"][0]["waybill"]
+
+            # === final assignment ===
+            if awb:
+                update_data["awb"] = awb
             else:
-                update_data["awb"] = f"DUMMY{random.randint(100000,999999)}"
+                print(f"❌ AWB not received even after retry for {order_id}")
+                update_data["awb"] = None  # no dummy assigned
 
         except Exception as e:
             print(f"❌ Delhivery Shipment creation error: {e}")
-            update_data["awb"] = f"DUMMY{random.randint(100000,999999)}"
+            update_data["awb"] = None  # ensure never dummy
 
     # ✅ commit update
     result = await db["orders"].update_one({"orderId": order_id}, {"$set": update_data})
@@ -833,6 +882,7 @@ async def update_order_status(order_id: str, request: Request, authorization: st
         "statusTimeline": status_timeline,
         "awb": update_data.get("awb", order.get("awb"))
     }
+
 
 # =============================
 # ⭐ Unified Timeline Endpoint
