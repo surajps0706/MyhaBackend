@@ -573,7 +573,7 @@ async def save_order(request: Request):
         # ✅ 1. Order ID logic
         myha_order_id = data.get("orderId")
         if not myha_order_id:
-            myha_order_id = await get_next_order_id()
+            raise HTTPException(status_code=400, detail="Missing orderId from frontend")
 
         data["orderId"] = myha_order_id
         data["razorpayOrderId"] = data.get("razorpayOrderId")
