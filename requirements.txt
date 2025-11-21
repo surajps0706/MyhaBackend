@@ -11,3 +11,4 @@ setuptools
 python-multipart
 httpx
 sib-api-v3-sdk
+email-validator==2.2.0
