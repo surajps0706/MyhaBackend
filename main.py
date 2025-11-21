@@ -889,10 +889,23 @@ async def update_order_status(order_id: str, request: Request, authorization: st
 # =============================
 @app.get("/orders/{order_id}/timeline")
 async def get_order_timeline(order_id: str):
+
+    # Try as string
     order = await db["orders"].find_one({"orderId": order_id})
+
+    # Try as number
+    if not order:
+        try:
+            numeric_id = int(order_id)
+            order = await db["orders"].find_one({"orderId": numeric_id})
+        except:
+            pass
+
+    # Not found at all
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    # Build admin timeline
     admin_timeline = []
     for status, time in order.get("statusTimeline", {}).items():
         admin_timeline.append({
@@ -901,16 +914,18 @@ async def get_order_timeline(order_id: str):
             "source": "Admin"
         })
 
+    # Build courier timeline
     courier_timeline = []
     if order.get("awb"):
         courier_timeline = await fetch_delhivery_tracking(order["awb"])
 
+    # Merge & sort
     full_timeline = admin_timeline + courier_timeline
-    # Note: both ISO strings and Delhivery timestamps are sortable strings (best-effort)
     full_timeline.sort(key=lambda x: x.get("time", ""))
 
+    # Return all order details + tracking
     return {
-        "orderId": order_id,
+        "orderId": order.get("orderId"),
         "awb": order.get("awb"),
         "timeline": full_timeline,
         "checkoutData": order.get("checkoutData"),
