@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import List, Optional
 from datetime import datetime
 
@@ -36,6 +36,26 @@ class Order(BaseModel):
     paymentType: str                       # "COD" or "Prepaid"
     awb: Optional[str] = None              # AWB number from Delhivery
     timeline: List[TimelineEntry] = []     # order timeline
+
+
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    phone: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    otp: str
+    newPassword: str
+
 # ----------------- NEW CODE END -----------------
 
 # uvicorn main:app --reload

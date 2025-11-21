@@ -4,6 +4,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 
+
+from models import ForgotPasswordRequest, ResetPasswordRequest
+
+
+
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import timedelta
+from models import UserCreate, UserLogin
+from database import users_collection
+import random
+
 from models import Product
 from database import db, get_next_order_id
 from bson import ObjectId
@@ -32,6 +44,30 @@ import json    # ⭐ for payload formatting
 # Load env vars
 # =============================
 load_dotenv()
+
+
+# =============================
+# JWT + PASSWORD HASHING SETTINGS
+# =============================
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+JWT_SECRET = os.getenv("JWT_SECRET", "myha-user-secret")
+JWT_ALGO = "HS256"
+JWT_EXPIRY_MIN = 60 * 24 * 14  # 14 days
+
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
+
+def create_jwt_token(data: dict, expires_minutes: int = JWT_EXPIRY_MIN):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=expires_minutes)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGO)
 
 
 def config_cloudinary(account="old"):
@@ -149,6 +185,72 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+
+@app.post("/forgot-password")
+async def forgot_password(req: ForgotPasswordRequest):
+    user = await users_collection.find_one({"email": req.email})
+    if not user:
+        raise HTTPException(404, "Email not registered")
+
+    otp = str(random.randint(100000, 999999))
+    expiry = datetime.utcnow() + timedelta(minutes=10)
+
+    await users_collection.update_one(
+        {"email": req.email},
+        {"$set": {
+            "resetOtp": otp,
+            "resetOtpExpiry": expiry
+        }}
+    )
+
+    # Send OTP Email
+    try:
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": req.email}],
+            sender={"name": "Myha Couture", "email": "order@myhacouture.com"},
+            subject="Myha Couture - Password Reset OTP",
+            html_content=f"<p>Your OTP for resetting the password is <b>{otp}</b>.<br>Valid for 10 minutes.</p>"
+        )
+        api_instance.send_transac_email(send_smtp_email)
+
+    except Exception as e:
+        print("Email error:", e)
+
+    return {"message": "OTP sent to your email"}
+
+# reset pass
+
+@app.post("/reset-password")
+async def reset_password(req: ResetPasswordRequest):
+    user = await users_collection.find_one({"email": req.email})
+    if not user:
+        raise HTTPException(404, "Invalid email")
+
+    # Check OTP
+    if str(user.get("resetOtp")) != req.otp:
+        raise HTTPException(400, "Invalid OTP")
+
+    # Check expiry
+    if datetime.utcnow() > user.get("resetOtpExpiry"):
+        raise HTTPException(400, "OTP expired")
+
+    # Hash new password
+    hashed = pwd_context.hash(req.newPassword)
+
+    # Update password + clear OTP
+    await users_collection.update_one(
+        {"email": req.email},
+        {"$set": {"password": hashed},
+         "$unset": {"resetOtp": "", "resetOtpExpiry": ""}}
+    )
+
+    return {"message": "Password reset successful"}
+
+
 # =============================
 # App startup: indexes
 # =============================
@@ -180,6 +282,48 @@ async def _ensure_indexes():
         await coll.create_index([("createdAt", 1)], name="createdAt_1")
     except OperationFailure as e:
         print(f"Index create warning (createdAt): {e}")
+
+
+
+from fastapi import Depends
+from jose import jwt, JWTError
+
+# ============================
+# Helper: Decode User JWT
+# ============================
+def get_current_user(token: str = Header(None)):
+    if not token:
+        raise HTTPException(status_code=401, detail="Token missing")
+
+    try:
+        payload = jwt.decode(token.replace("Bearer ", ""), JWT_SECRET, algorithms=[JWT_ALGO])
+        return payload
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# ============================
+# ✨ My Orders (Customer Only)
+# ============================
+@app.get("/my-orders")
+async def my_orders(user=Depends(get_current_user)):
+    email = user.get("email")
+
+    orders_cursor = db["orders"].find(
+        {"checkoutData.email": email},
+        {
+            "_id": 0,
+            "orderId": 1,
+            "status": 1,
+            "createdAt": 1,
+            "grandTotal": 1,
+            "cartItems": 1,
+            "awb": 1
+        }
+    ).sort("createdAt", -1)
+
+    orders = [o async for o in orders_cursor]
+    return {"orders": orders}
 
 
 # =============================
@@ -972,6 +1116,64 @@ async def export_orders(authorization: str = Header(None)):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=orders.xlsx"}
     )
+
+
+
+
+
+# =============================
+# USER SIGNUP
+# =============================
+@app.post("/signup")
+async def signup(user: UserCreate):
+    # Check duplicate email
+    existing = await users_collection.find_one({"email": user.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    hashed = hash_password(user.password)
+
+    user_data = {
+        "name": user.name,
+        "email": user.email,
+        "phone": user.phone,
+        "password": hashed,
+        "createdAt": iso_now()
+    }
+
+    await users_collection.insert_one(user_data)
+
+    return {"message": "Account created successfully"}
+
+
+# =============================
+# USER LOGIN
+# =============================
+@app.post("/login")
+async def login(user: UserLogin):
+    # Find user by email
+    existing = await users_collection.find_one({"email": user.email})
+    if not existing:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not verify_password(user.password, existing["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    # JWT payload
+    token_data = {
+        "userId": str(existing["_id"]),
+        "email": existing["email"],
+        "role": "customer"
+    }
+
+    token = create_jwt_token(token_data)
+
+    return {
+        "token": token,
+        "role": "customer",
+        "name": existing["name"]
+    }
+
 
 
 # =============================
