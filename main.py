@@ -912,7 +912,14 @@ async def get_order_timeline(order_id: str):
     return {
         "orderId": order_id,
         "awb": order.get("awb"),
-        "timeline": full_timeline
+        "timeline": full_timeline,
+        "checkoutData": order.get("checkoutData"),
+        "cartItems": order.get("cartItems"),
+        "grandTotal": order.get("grandTotal"),
+        "shippingCost": order.get("shippingCost"),
+        "totalAmount": order.get("totalAmount"),
+        "status": order.get("status"),
+        "createdAt": order.get("createdAt")
     }
 
 
