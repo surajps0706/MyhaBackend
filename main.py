@@ -1185,10 +1185,19 @@ async def admin_login(request: Request):
     username = data.get("username")
     password = data.get("password")
 
-    if username == os.getenv("ADMIN_USER", "admin") and password == os.getenv("ADMIN_PASSWORD", "super-secret"):
-        return {"token": os.getenv("ADMIN_TOKEN", "myha-secret")}
+    ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "super-secret")
+    ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "myha-secret")
+
+    if username == ADMIN_USER and password == ADMIN_PASSWORD:
+        return {
+            "token": ADMIN_TOKEN,
+            "role": "admin",
+            "name": "Admin"
+        }
 
     raise HTTPException(status_code=401, detail="Invalid credentials")
+
 
 
 # =============================
