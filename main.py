@@ -217,8 +217,21 @@ async def forgot_password(req: ForgotPasswordRequest):
         )
         api_instance.send_transac_email(send_smtp_email)
 
+    except ApiException as e:
+        print("❌ Brevo API error")
+        print("Status:", e.status)
+        print("Body:", e.body)
+        raise HTTPException(
+            status_code=500,
+            detail="Email service failed. Please try again later."
+        )
+
     except Exception as e:
-        print("Email error:", e)
+        print("❌ Unexpected email error:", str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Unexpected email error"
+        )
 
     return {"message": "OTP sent to your email"}
 
@@ -483,9 +496,20 @@ def send_order_email(to_email, order_data, is_admin=False):
         print(f"✅ Order email sent to {to_email}, messageId={response.message_id}")
 
     except ApiException as e:
-        print(f"❌ Brevo API error: {e}")
+        print("❌ Brevo API error")
+        print("Status:", e.status)
+        print("Body:", e.body)
+        raise HTTPException(
+            status_code=500,
+            detail="Email service failed. Please try again later."
+        )
+
     except Exception as e:
-        print(f"❌ Unexpected error in send_order_email: {e}")
+        print("❌ Unexpected email error:", str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Unexpected email error"
+        )
 
 
         
