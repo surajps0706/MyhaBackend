@@ -733,29 +733,36 @@ async def fetch_shipping_charge(destination_pincode: str, weight: int = 500, pt:
 # (Normalized cartItems + ISO timestamps)
 # =============================
 from database import db, get_next_order_id  # ✅ ensure this import is at the top
-
 @app.post("/save-order")
 async def save_order(request: Request):
     data = await request.json()
-    try:
-        # ✅ 1. Order ID logic
-        myha_order_id = data.get("orderId")
-        if not myha_order_id:
-            raise HTTPException(status_code=400, detail="Missing orderId from frontend")
 
-        data["orderId"] = myha_order_id
-        data["razorpayOrderId"] = data.get("razorpayOrderId")
-        data["razorpayPaymentId"] = data.get("razorpayPaymentId")
+    # =========================
+    # 1️⃣ Validate orderId
+    # =========================
+    myha_order_id = data.get("orderId")
+    if not myha_order_id:
+        raise HTTPException(status_code=400, detail="Missing orderId from frontend")
 
-        # ✅ 2. Status + timestamps
-        now = iso_now()
-        data["status"] = "Ordered"
-        data["createdAt"] = now
-        data["statusTimeline"] = {"Ordered": now}
+    data["orderId"] = myha_order_id
+    data["razorpayOrderId"] = data.get("razorpayOrderId")
+    data["razorpayPaymentId"] = data.get("razorpayPaymentId")
 
-        # ✅ 3. Normalize cart items
-        normalized_items = []
-        for it in data.get("cartItems", []):
+    # =========================
+    # 2️⃣ Status + timestamps
+    # =========================
+    now = iso_now()
+    data["status"] = "Ordered"
+    data["createdAt"] = now
+    data["statusTimeline"] = {"Ordered": now}
+
+    # =========================
+    # 3️⃣ Normalize cart items
+    # =========================
+    normalized_items = []
+
+    for it in data.get("cartItems", []):
+        try:
             price = it.get("price", 0)
             if isinstance(price, str):
                 price = price.replace("₹", "").replace(",", "").strip()
@@ -775,81 +782,93 @@ async def save_order(request: Request):
                 "price": price,
                 "quantity": qty,
                 "selectedSize": it.get("selectedSize"),
-
-                # ✅ Sleeve customization
                 "sleeveType": it.get("sleeveType"),
                 "sleevePrice": sleeve_price,
-
-                # ✅ Height customization (store actual text/value)
                 "preferredHeight": it.get("preferredHeight"),
                 "extraHeightPrice": height_price,
-
-                # ✅ Neck customization (store typed text)
-                "neckCustomization": it.get("neckCustomization", None),
-
-                # ✅ Optional bust size adjustment
-                "bustExtra": float(it.get("bustExtra", 0) or 0),
-
-                # ✅ Calculated totals + notes
+                "neckCustomization": it.get("neckCustomization"),
+                "bustExtra": bust_price,
                 "lineTotal": line_total,
                 "measurements": it.get("measurements", {}),
                 "customizationNotes": it.get("customizationNotes", "")
             })
 
-        if normalized_items:
-            data["cartItems"] = normalized_items
+        except Exception as e:
+            print("⚠️ Cart item normalization failed:", e)
 
-        # ✅ 4. Calculate totals
-        cart_total = sum(it["lineTotal"] for it in normalized_items)
+    data["cartItems"] = normalized_items
 
-        # ✅ 5. Fetch shipping charge
-        checkout = data.get("checkoutData") or {}
-        if isinstance(checkout, list):
-            checkout = checkout[0] if checkout else {}
+    # =========================
+    # 4️⃣ Calculate totals
+    # =========================
+    cart_total = sum(it["lineTotal"] for it in normalized_items)
 
-        dest_pincode = checkout.get("pincode") if isinstance(checkout, dict) else None
-        shipping_cost = 0
-        if dest_pincode:
-            try:
-                shipping_cost = await fetch_shipping_charge(dest_pincode)
-            except Exception as e:
-                print("⚠️ Shipping charge fetch failed:", e)
-                shipping_cost = 0
+    checkout = data.get("checkoutData") or {}
+    if isinstance(checkout, list):
+        checkout = checkout[0] if checkout else {}
 
-        grand_total = cart_total + shipping_cost
+    shipping_cost = 0
+    dest_pincode = checkout.get("pincode")
 
-        data["cartTotal"] = cart_total
-        data["shippingCost"] = shipping_cost
-        data["grandTotal"] = grand_total
+    if dest_pincode:
+        try:
+            shipping_cost = await fetch_shipping_charge(dest_pincode)
+        except Exception as e:
+            print("⚠️ Shipping charge failed:", e)
 
-        # ✅ 6. Save order (update existing or insert new)
-        existing = await db["orders"].find_one({"orderId": data["orderId"]})
+    grand_total = cart_total + shipping_cost
+
+    data["cartTotal"] = cart_total
+    data["shippingCost"] = shipping_cost
+    data["grandTotal"] = grand_total
+
+    # =========================
+    # 5️⃣ Save order (DB is CRITICAL)
+    # =========================
+    try:
+        existing = await db["orders"].find_one({"orderId": myha_order_id})
+
         if existing:
-            await db["orders"].update_one({"orderId": data["orderId"]}, {"$set": data})
+            await db["orders"].update_one(
+                {"orderId": myha_order_id},
+                {"$set": data}
+            )
             result_id = existing["_id"]
         else:
-            insert_result = await db["orders"].insert_one(data)
-            result_id = insert_result.inserted_id
-
-        # ✅ 7. Send confirmation emails
-        customer_email = checkout.get("email") if isinstance(checkout, dict) else None
-        if customer_email:
-            send_order_email(customer_email, data, is_admin=False)
-        if ADMIN_EMAIL:
-            send_order_email(ADMIN_EMAIL, data, is_admin=True)
-
-        # ✅ 8. Final response
-        return {
-            "message": "Order saved",
-            "id": str(result_id),
-            "orderId": myha_order_id,
-            "shippingCost": shipping_cost,
-            "grandTotal": grand_total
-        }
+            result = await db["orders"].insert_one(data)
+            result_id = result.inserted_id
 
     except Exception as e:
-        print("❌ ERROR saving order:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        print("❌ DATABASE SAVE FAILED:", e)
+        raise HTTPException(status_code=500, detail="Order save failed")
+
+    # =========================
+    # 6️⃣ Send emails (BEST-EFFORT ONLY)
+    # =========================
+    customer_email = checkout.get("email")
+
+    try:
+        if customer_email:
+            send_order_email(customer_email, data, is_admin=False)
+    except Exception as e:
+        print("⚠️ Customer email failed:", e)
+
+    try:
+        if ADMIN_EMAIL:
+            send_order_email(ADMIN_EMAIL, data, is_admin=True)
+    except Exception as e:
+        print("⚠️ Admin email failed:", e)
+
+    # =========================
+    # 7️⃣ FINAL RESPONSE (never blocked)
+    # =========================
+    return {
+        "message": "Order saved successfully",
+        "orderId": myha_order_id,
+        "id": str(result_id),
+        "shippingCost": shipping_cost,
+        "grandTotal": grand_total
+    }
 
 
 # =============================
