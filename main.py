@@ -588,39 +588,39 @@ async def get_product(product_id: str):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-@app.post("/admin/test-email")
-async def test_email():
-    print("🚨 TEST EMAIL ENDPOINT HIT 🚨")
+# @app.post("/admin/test-email")
+# async def test_email():
+#     print("🚨 TEST EMAIL ENDPOINT HIT 🚨")
 
-    dummy_order = {
-        "orderId": "TEST123",
-        "checkoutData": {
-            "name": "Test User",
-            "email": "snmsss2002l@gmail.com",
-            "phone": "9999999999",
-            "addressLine1": "Test Address",
-            "city": "Chennai",
-            "state": "Tamil Nadu",
-            "pincode": "600001"
-        },
-        "cartItems": [
-            {
-                "name": "Test Product",
-                "price": 1000,
-                "quantity": 1,
-                "images": ["https://via.placeholder.com/150"]
-            }
-        ],
-        "totalAmount": 1000
-    }
+#     dummy_order = {
+#         "orderId": "TEST123",
+#         "checkoutData": {
+#             "name": "Test User",
+#             "email": "snmsss2002l@gmail.com",
+#             "phone": "9999999999",
+#             "addressLine1": "Test Address",
+#             "city": "Chennai",
+#             "state": "Tamil Nadu",
+#             "pincode": "600001"
+#         },
+#         "cartItems": [
+#             {
+#                 "name": "Test Product",
+#                 "price": 1000,
+#                 "quantity": 1,
+#                 "images": ["https://via.placeholder.com/150"]
+#             }
+#         ],
+#         "totalAmount": 1000
+#     }
 
-    send_order_email(
-        to_email="snmsss2002@gmail.com",
-        order_data=dummy_order,
-        is_admin=False
-    )
+#     send_order_email(
+#         to_email="snmsss2002@gmail.com",
+#         order_data=dummy_order,
+#         is_admin=False
+#     )
 
-    return {"status": "test email triggered"}
+#     return {"status": "test email triggered"}
 
 
 
