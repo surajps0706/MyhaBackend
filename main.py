@@ -651,7 +651,7 @@ async def get_product(product_id: str):
 
 
 @app.post("/add-product")
-async def add_product(product: ProductCreate):
+async def add_product(product: Product):
     if product.image_count <= 0:
         raise HTTPException(
             status_code=400,
