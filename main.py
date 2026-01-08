@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
-
+from models import ProductCreate
 
 from models import ForgotPasswordRequest, ResetPasswordRequest
 
@@ -651,7 +651,7 @@ async def get_product(product_id: str):
 
 
 @app.post("/add-product")
-async def add_product(product: Product):
+async def add_product(product: ProductCreate):
     if product.image_count <= 0:
         raise HTTPException(
             status_code=400,
