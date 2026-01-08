@@ -184,6 +184,20 @@ def fix_id(doc: Dict[str, Any]) -> Dict[str, Any]:
 def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+# =============================
+# Image URL Builder (R2)
+# =============================
+R2_BASE = os.getenv("R2_PUBLIC_BASE_URL")
+print("🔥 R2_BASE =", R2_BASE)
+
+
+def build_product_image_urls(product_id: str, image_count: int):
+    if not R2_BASE or not image_count:
+        return []
+    return [
+        f"{R2_BASE}/products/{product_id}/{i}.jpg"
+        for i in range(1, image_count + 1)
+    ]
 
 
 @app.post("/forgot-password")
@@ -571,7 +585,12 @@ async def get_products():
         products_cursor = db["products"].find().sort([("displayOrder", 1), ("createdAt", -1)])
         products = []
         async for product in products_cursor:
-            products.append(fix_id(product))
+            product = fix_id(product)
+            product["images"] = build_product_image_urls(
+                product["id"],
+                 product.get("image_count", 0)
+            )
+            products.append(product)
         return products
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -583,7 +602,13 @@ async def get_product(product_id: str):
         product = await db["products"].find_one({"_id": ObjectId(product_id)})
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
-        return fix_id(product)
+        product = fix_id(product)
+        product["images"] = build_product_image_urls(
+            product["id"],
+            product.get("image_count", 0)
+        )
+        return product
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -647,32 +672,10 @@ async def upload_product(
     images: List[UploadFile] = File(None),
     authorization: str = Header(None)
 ):
-    if authorization != f"Bearer {ADMIN_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    try:
-        image_urls = []
-        if images:
-            for img in images:
-                image_urls.append(upload_image(img.file, use_new=True))
-                # upload_result = cloudinary.uploader.upload(img.file)
-                # image_urls.append(upload_result["secure_url"])
-
-        product_data = {
-            "name": name,
-            "price": price,
-            "description": description,
-            "category": category,
-            "sizes": sizes,
-            "colors": colors,
-            "images": image_urls,
-            "createdAt": iso_now()
-        }
-
-        result = await db["products"].insert_one(product_data)
-        return {"message": "✅ Product uploaded", "id": str(result.inserted_id), "product": product_data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+   raise HTTPException(
+        status_code=410,
+        detail="Product image upload is temporarily disabled. Use R2 manual upload."
+    )
 
 
 # =============================
@@ -1378,35 +1381,11 @@ async def track_order(request: Request):
 
 @app.post("/add-product-url")
 async def add_product_url(request: Request, authorization: str = Header(None)):
-    if authorization != f"Bearer {ADMIN_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    raise HTTPException(
+        status_code=410,
+        detail="Product image upload is temporarily disabled. Use R2 manual upload."
+    )
 
-    data = await request.json()
-    try:
-        product_data = {
-            "name": data.get("name"),
-            "price": data.get("price"),
-            "description": data.get("description"),
-            "category": data.get("category"),
-            "sizes": data.get("sizes", ["Customizable"]),
-            "colors": data.get("colors", ["Default"]),
-            "selectedSize": data.get("selectedSize", "Free Size"),
-            "selectedColor": data.get("selectedColor", ""),
-            "images": data.get("images", []),
-            "createdAt": iso_now()
-        }
-
-        result = await db["products"].insert_one(product_data)
-        saved_product = await db["products"].find_one({"_id": result.inserted_id})
-        saved_product = fix_id(saved_product)
-
-        return {
-            "message": "✅ Product added",
-            "id": str(result.inserted_id),
-            "product": saved_product
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 # =============================
 # Reviews API
