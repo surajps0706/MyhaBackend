@@ -651,32 +651,31 @@ async def get_product(product_id: str):
 
 
 @app.post("/add-product")
-async def add_product(product: Product):
-    try:
-        if product.image_count <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="image_count must be greater than 0"
-            )
-
-        product_data = product.dict()
-        product_data["createdAt"] = iso_now()
-
-        result = await db["products"].insert_one(product_data)
-        return {
-            "message": "Product added",
-            "id": str(result.inserted_id)
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
+async def add_product(product: ProductCreate):
+    if product.image_count <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="image_count must be greater than 0"
         )
 
+    product_data = product.dict()
+
+    # 🔑 system-generated defaults
+    product_data.update({
+        "selectedSize": "Free Size",
+        "selectedColor": product.colors[0] if product.colors else "",
+        "images": [],               # images come from R2
+        "isSoldOut": False,
+        "displayOrder": 0,
+        "createdAt": iso_now()
+    })
+
+    result = await db["products"].insert_one(product_data)
+
+    return {
+        "message": "Product added",
+        "id": str(result.inserted_id)
+    }
 
 
 @app.post("/upload-product")

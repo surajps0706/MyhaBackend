@@ -18,6 +18,19 @@ class Product(BaseModel):
 
 
 
+class ProductCreate(BaseModel):
+    name: str
+    price: float
+    description: str
+    category: str
+    sizes: List[str]
+    colors: List[str]
+    image_count: int
+    enableFabricPrice: Optional[bool] = False
+    fabricBasePrice: Optional[int] = None
+    stock: Optional[int] = 0
+
+
 # ----------------- NEW CODE -----------------
 class TimelineEntry(BaseModel):
     status: str                 # e.g., "Preparing", "Packed", "Picked Up"
