@@ -61,4 +61,3 @@ class ResetPasswordRequest(BaseModel):
 
 # uvicorn main:app --reload
 # .\env\Scripts\activate
-# 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
