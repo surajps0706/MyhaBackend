@@ -1330,7 +1330,7 @@ async def update_product(product_id: str, request: Request, authorization: str =
         {"_id": ObjectId(product_id)},
         {"$set": data}
     )
-    if result.modified_count == 0:
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Product not found")
     return {"message": "Product updated"}
 
