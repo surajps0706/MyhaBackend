@@ -15,6 +15,7 @@ class Product(BaseModel):
     isSoldOut: Optional[bool] = False   # 🆕 Added line
     displayOrder: Optional[int] = 0
     image_count: int
+    enableCustomizationNotes: Optional[bool] = True
 
 
 
@@ -29,6 +30,7 @@ class ProductCreate(BaseModel):
     enableFabricPrice: Optional[bool] = False
     fabricBasePrice: Optional[int] = None
     stock: Optional[int] = 0
+    enableCustomizationNotes: Optional[bool] = True
 
 
 # ----------------- NEW CODE -----------------
