@@ -803,20 +803,30 @@ async def save_order(request: Request):
     # 1️⃣ Validate orderId
     # =========================
     myha_order_id = data.get("orderId")
+
     if not myha_order_id:
-        raise HTTPException(status_code=400, detail="Missing orderId from frontend")
+        raise HTTPException(
+            status_code=400,
+            detail="Missing orderId from frontend"
+        )
 
     data["orderId"] = myha_order_id
     data["razorpayOrderId"] = data.get("razorpayOrderId")
     data["razorpayPaymentId"] = data.get("razorpayPaymentId")
 
+
     # =========================
     # 2️⃣ Status + timestamps
     # =========================
     now = iso_now()
+
     data["status"] = "Ordered"
     data["createdAt"] = now
-    data["statusTimeline"] = {"Ordered": now}
+
+    data["statusTimeline"] = {
+        "Ordered": now
+    }
+
 
     # =========================
     # 3️⃣ Normalize cart items
@@ -824,114 +834,230 @@ async def save_order(request: Request):
     normalized_items = []
 
     for it in data.get("cartItems", []):
+
         try:
             price = it.get("price", 0)
+
             if isinstance(price, str):
-                price = price.replace("₹", "").replace(",", "").strip()
+                price = (
+                    price
+                    .replace("₹", "")
+                    .replace(",", "")
+                    .strip()
+                )
+
             price = float(price or 0)
 
             qty = int(it.get("quantity", 1))
-            sleeve_price = float(it.get("sleevePrice", 0) or 0)
-            height_price = float(it.get("extraHeightPrice", 0) or 0)
-            bust_price = float(it.get("bustExtra", 0) or 0)
 
-            line_total = (price + sleeve_price + height_price + bust_price) * qty
+            sleeve_price = float(
+                it.get("sleevePrice", 0) or 0
+            )
+
+            height_price = float(
+                it.get("extraHeightPrice", 0) or 0
+            )
+
+            bust_price = float(
+                it.get("bustExtra", 0) or 0
+            )
+
+
+            line_total = (
+                price
+                + sleeve_price
+                + height_price
+                + bust_price
+            ) * qty
+
 
             normalized_items.append({
                 "productId": it.get("productId") or it.get("_id"),
                 "name": it.get("name", "N/A"),
-                "image": (it.get("images") or [""])[0] if it.get("images") else it.get("image", ""),
+
+                "image": (
+                    (it.get("images") or [""])[0]
+                    if it.get("images")
+                    else it.get("image", "")
+                ),
+
                 "price": price,
                 "quantity": qty,
+
                 "selectedSize": it.get("selectedSize"),
+
                 "sleeveType": it.get("sleeveType"),
                 "sleevePrice": sleeve_price,
+
                 "preferredHeight": it.get("preferredHeight"),
                 "extraHeightPrice": height_price,
+
                 "neckCustomization": it.get("neckCustomization"),
+
                 "bustExtra": bust_price,
+
                 "lineTotal": line_total,
+
                 "measurements": it.get("measurements", {}),
-                "customizationNotes": it.get("customizationNotes", "")
+
+                "customizationNotes": it.get(
+                    "customizationNotes",
+                    ""
+                )
             })
 
+
         except Exception as e:
-            print("⚠️ Cart item normalization failed:", e)
+            print(
+                "⚠️ Cart item normalization failed:",
+                e
+            )
+
 
     data["cartItems"] = normalized_items
+
+
 
     # =========================
     # 4️⃣ Calculate totals
     # =========================
-    cart_total = sum(it["lineTotal"] for it in normalized_items)
+
+    cart_total = sum(
+        item["lineTotal"]
+        for item in normalized_items
+    )
+
 
     checkout = data.get("checkoutData") or {}
+
     if isinstance(checkout, list):
         checkout = checkout[0] if checkout else {}
 
-    shipping_cost = 0
-    dest_pincode = checkout.get("pincode")
 
-    if dest_pincode:
-        try:
-            shipping_cost = await fetch_shipping_charge(dest_pincode)
-        except Exception as e:
-            print("⚠️ Shipping charge failed:", e)
+    # IMPORTANT FIX
+    # Use already paid shipping amount
+    # Do NOT call Delhivery again here
+
+    shipping_cost = float(
+        data.get("shippingCost", 0) or 0
+    )
+
 
     grand_total = cart_total + shipping_cost
+
 
     data["cartTotal"] = cart_total
     data["shippingCost"] = shipping_cost
     data["grandTotal"] = grand_total
 
+
+
     # =========================
-    # 5️⃣ Save order (DB is CRITICAL)
+    # 5️⃣ Save order
     # =========================
+
     try:
-        existing = await db["orders"].find_one({"orderId": myha_order_id})
+
+        existing = await db["orders"].find_one(
+            {
+                "orderId": myha_order_id
+            }
+        )
+
 
         if existing:
+
             await db["orders"].update_one(
-                {"orderId": myha_order_id},
-                {"$set": data}
+                {
+                    "orderId": myha_order_id
+                },
+                {
+                    "$set": data
+                }
             )
+
             result_id = existing["_id"]
+
+
         else:
-            result = await db["orders"].insert_one(data)
+
+            result = await db["orders"].insert_one(
+                data
+            )
+
             result_id = result.inserted_id
 
+
+
     except Exception as e:
-        print("❌ DATABASE SAVE FAILED:", e)
-        raise HTTPException(status_code=500, detail="Order save failed")
+
+        print(
+            "❌ DATABASE SAVE FAILED:",
+            e
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Order save failed"
+        )
+
+
 
     # =========================
-    # 6️⃣ Send emails (BEST-EFFORT ONLY)
+    # 6️⃣ Emails
     # =========================
+
     customer_email = checkout.get("email")
 
+
     try:
+
         if customer_email:
-            send_order_email(customer_email, data, is_admin=False)
+            send_order_email(
+                customer_email,
+                data,
+                is_admin=False
+            )
+
     except Exception as e:
-        print("⚠️ Customer email failed:", e)
+        print(
+            "⚠️ Customer email failed:",
+            e
+        )
+
+
 
     try:
+
         if ADMIN_EMAIL:
-            send_order_email(ADMIN_EMAIL, data, is_admin=True)
+            send_order_email(
+                ADMIN_EMAIL,
+                data,
+                is_admin=True
+            )
+
+
     except Exception as e:
-        print("⚠️ Admin email failed:", e)
+
+        print(
+            "⚠️ Admin email failed:",
+            e
+        )
+
+
 
     # =========================
-    # 7️⃣ FINAL RESPONSE (never blocked)
+    # 7️⃣ Response
     # =========================
+
     return {
         "message": "Order saved successfully",
         "orderId": myha_order_id,
         "id": str(result_id),
+        "cartTotal": cart_total,
         "shippingCost": shipping_cost,
         "grandTotal": grand_total
     }
-
 
 # =============================
 # Admin: View Orders (projection + sort)
