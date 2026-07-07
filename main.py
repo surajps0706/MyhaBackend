@@ -165,6 +165,7 @@ app.add_middleware(
         "https://taupe-cannoli-010c45.netlify.app",
         "https://myhacouture.com",
         "https://www.myhacouture.com",
+        "https://myhafrontend.pages.dev"
     ],
     allow_credentials=True,
     allow_methods=["*"],
