@@ -60,6 +60,17 @@ JWT_EXPIRY_MIN = 60 * 24 * 14  # 14 days
 
 
 
+DEFAULT_SIZES = [
+    {"label": "XXS", "available": True},
+    {"label": "XS", "available": True},
+    {"label": "S", "available": True},
+    {"label": "M", "available": True},
+    {"label": "L", "available": True},
+    {"label": "XL", "available": True},
+    {"label": "2XL", "available": True},
+    {"label": "3XL", "available": True},
+]
+
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
@@ -699,7 +710,8 @@ async def add_product(product: ProductCreate):
 
     # 🔑 system-generated defaults
     product_data.update({
-        "selectedSize": "Free Size",
+        "sizes": DEFAULT_SIZES.copy(),
+        "selectedSize": "M",
         "selectedColor": product.colors[0] if product.colors else "",
         "images": [],               # images come from R2
         "isSoldOut": False,
