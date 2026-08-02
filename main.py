@@ -222,6 +222,21 @@ def build_product_image_urls(product_id: str, image_count: int):
     ]
 
 
+from io import BytesIO
+
+def upload_to_r2(file_bytes: bytes, object_key: str, content_type: str = "image/jpeg"):
+    r2_client.upload_fileobj(
+        BytesIO(file_bytes),
+        R2_BUCKET_NAME,
+        object_key,
+        ExtraArgs={
+            "ContentType": content_type
+        }
+    )
+
+
+
+
 @app.post("/forgot-password")
 async def forgot_password(req: ForgotPasswordRequest):
     user = await users_collection.find_one({"email": req.email})
@@ -674,7 +689,7 @@ async def get_product(product_id: str):
 
 @app.post("/add-product")
 async def add_product(product: ProductCreate):
-    if product.image_count <= 0:
+    if product.image_count < 0:
         raise HTTPException(
             status_code=400,
             detail="image_count must be greater than 0"
@@ -699,6 +714,121 @@ async def add_product(product: ProductCreate):
         "id": str(result.inserted_id)
     }
 
+
+@app.post("/upload-product-images/{product_id}")
+async def upload_product_images(
+    product_id: str,
+    images: List[UploadFile] = File(...),
+    authorization: str = Header(None)
+):
+    # =============================
+    # Admin Authentication
+    # =============================
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    # =============================
+    # Validate Product ID
+    # =============================
+    try:
+        object_id = ObjectId(product_id)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid product ID"
+        )
+
+    # =============================
+    # Verify Product Exists
+    # =============================
+    product = await db["products"].find_one({"_id": object_id})
+
+    if not product:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+    # =============================
+    # Validate Images
+    # =============================
+    if not images:
+        raise HTTPException(
+            status_code=400,
+            detail="No images uploaded"
+        )
+
+    if len(images) > 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Maximum 20 images allowed"
+        )
+
+    allowed_types = {
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+        "image/heic",
+        "image/heif"
+    }
+
+    image_count = 0
+
+    try:
+
+        for index, image in enumerate(images, start=1):
+
+            if image.content_type not in allowed_types:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file type: {image.filename}"
+                )
+
+            print(f"⬆ Uploading {image.filename} -> products/{product_id}/{index}.jpg")
+
+            contents = await image.read()
+
+            upload_to_r2(
+                contents,
+                f"products/{product_id}/{index}.jpg",
+                "image/jpeg"
+            )
+
+            image_count += 1
+
+        # =============================
+        # Update MongoDB
+        # =============================
+        await db["products"].update_one(
+            {"_id": object_id},
+            {
+                "$set": {
+                    "image_count": image_count
+                }
+            }
+        )
+
+        return {
+            "success": True,
+            "message": "Images uploaded successfully",
+            "productId": product_id,
+            "image_count": image_count
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print(f"❌ Image upload failed: {e}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to upload images"
+        )
 
 @app.post("/upload-product")
 async def upload_product(
