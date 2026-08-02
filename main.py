@@ -9,6 +9,9 @@ from models import ForgotPasswordRequest, ResetPasswordRequest
 import asyncio
 
 
+import boto3
+from botocore.client import Config
+
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import timedelta
@@ -190,6 +193,24 @@ def iso_now() -> str:
 # =============================
 R2_BASE = os.getenv("R2_PUBLIC_BASE_URL")
 print("🔥 R2_BASE =", R2_BASE)
+
+# =============================
+# Cloudflare R2 Upload Client
+# =============================
+
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+
+r2_client = boto3.client(
+    "s3",
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="auto"
+)
 
 
 def build_product_image_urls(product_id: str, image_count: int):
