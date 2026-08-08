@@ -1754,7 +1754,7 @@ async def add_product_images(
     authorization: str = Header(None)
 ):
     # =============================
-    # Admin Authentication
+    # 1. Admin Authentication
     # =============================
     if authorization != f"Bearer {ADMIN_TOKEN}":
         raise HTTPException(
@@ -1763,7 +1763,7 @@ async def add_product_images(
         )
 
     # =============================
-    # Validate Product ID
+    # 2. Validate Product ID
     # =============================
     try:
         object_id = ObjectId(product_id)
@@ -1774,7 +1774,7 @@ async def add_product_images(
         )
 
     # =============================
-    # Get Product
+    # 3. Get Existing Product
     # =============================
     product = await db["products"].find_one(
         {"_id": object_id}
@@ -1787,15 +1787,7 @@ async def add_product_images(
         )
 
     # =============================
-    # Existing images
-    # =============================
-    existing_images = product.get("images", [])
-
-    if not isinstance(existing_images, list):
-        existing_images = []
-
-    # =============================
-    # Validate count
+    # 4. Validate Upload
     # =============================
     if not images:
         raise HTTPException(
@@ -1803,7 +1795,14 @@ async def add_product_images(
             detail="No images uploaded"
         )
 
-    if len(existing_images) + len(images) > 20:
+    # IMPORTANT:
+    # Your system uses image_count as the
+    # source of truth for R2 numbered images.
+    existing_count = int(
+        product.get("image_count", 0) or 0
+    )
+
+    if existing_count + len(images) > 20:
         raise HTTPException(
             status_code=400,
             detail="Maximum 20 images allowed"
@@ -1818,14 +1817,14 @@ async def add_product_images(
         "image/heif"
     }
 
-    new_image_urls = []
-
     try:
 
-        # Start numbering after existing images
-        next_index = len(existing_images) + 1
+        # =============================
+        # 5. Start AFTER existing images
+        # =============================
+        start_index = existing_count + 1
 
-        for image in images:
+        for offset, image in enumerate(images):
 
             if image.content_type not in allowed_types:
                 raise HTTPException(
@@ -1833,15 +1832,18 @@ async def add_product_images(
                     detail=f"Unsupported file type: {image.filename}"
                 )
 
-            contents = await image.read()
+            image_number = start_index + offset
 
             object_key = (
-                f"products/{product_id}/{next_index}.jpg"
+                f"products/{product_id}/{image_number}.jpg"
             )
 
             print(
-                f"⬆ Uploading new image: {object_key}"
+                f"⬆ Adding image: {image.filename} "
+                f"-> {object_key}"
             )
+
+            contents = await image.read()
 
             upload_to_r2(
                 contents,
@@ -1849,37 +1851,37 @@ async def add_product_images(
                 "image/jpeg"
             )
 
-            image_url = (
-                f"{R2_PUBLIC_URL}/{object_key}"
-            )
-
-            new_image_urls.append(image_url)
-
-            next_index += 1
+        # =============================
+        # 6. New total count
+        # =============================
+        new_image_count = existing_count + len(images)
 
         # =============================
-        # Combine old + new
+        # 7. Update MongoDB
         # =============================
-        updated_images = (
-            existing_images + new_image_urls
-        )
-
         await db["products"].update_one(
             {"_id": object_id},
             {
                 "$set": {
-                    "images": updated_images,
-                    "image_count": len(updated_images)
+                    "image_count": new_image_count
                 }
             }
+        )
+
+        # =============================
+        # 8. Build ALL image URLs
+        # =============================
+        all_images = build_product_image_urls(
+            product_id,
+            new_image_count
         )
 
         return {
             "success": True,
             "message": "Images added successfully",
             "productId": product_id,
-            "images": updated_images,
-            "image_count": len(updated_images)
+            "images": all_images,
+            "image_count": new_image_count
         }
 
     except HTTPException:
@@ -1888,7 +1890,7 @@ async def add_product_images(
     except Exception as e:
 
         print(
-            f"❌ Failed to add product images: {e}"
+            f"❌ Add image upload failed: {e}"
         )
 
         raise HTTPException(
@@ -1897,7 +1899,6 @@ async def add_product_images(
         )
 
     
-
 @app.get("/orders/{order_id}")
 async def get_order(order_id: str, authorization: str = Header(None)):
     if authorization != f"Bearer {ADMIN_TOKEN}":
