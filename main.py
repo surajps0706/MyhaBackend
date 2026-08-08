@@ -245,6 +245,12 @@ def upload_to_r2(file_bytes: bytes, object_key: str, content_type: str = "image/
         }
     )
 
+def delete_from_r2(object_key: str):
+    r2_client.delete_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=object_key
+    )
+
 
 
 
@@ -1612,18 +1618,285 @@ async def delete_product(product_id: str, authorization: str = Header(None)):
 # Admin: Update Product
 # =============================
 @app.put("/products/{product_id}")
-async def update_product(product_id: str, request: Request, authorization: str = Header(None)):
+async def update_product(
+    product_id: str,
+    request: Request,
+    authorization: str = Header(None)
+):
+    # =========================
+    # 1. Admin authentication
+    # =========================
     if authorization != f"Bearer {ADMIN_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    data = await request.json()
-    result = await db["products"].update_one(
-        {"_id": ObjectId(product_id)},
-        {"$set": data}
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Product not found")
-    return {"message": "Product updated"}
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
 
+    # =========================
+    # 2. Validate ObjectId
+    # =========================
+    try:
+        product_object_id = ObjectId(product_id)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid product ID"
+        )
+
+    # =========================
+    # 3. Get existing product
+    # =========================
+    existing_product = await db["products"].find_one(
+        {"_id": product_object_id}
+    )
+
+    if not existing_product:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+    # =========================
+    # 4. Read request body
+    # =========================
+    data = await request.json()
+
+    # =========================
+    # 5. Existing images
+    # =========================
+    old_images = existing_product.get("images", [])
+
+    if not isinstance(old_images, list):
+        old_images = []
+
+    # =========================
+    # 6. New image array
+    # =========================
+    new_images = data.get("images", old_images)
+
+    if not isinstance(new_images, list):
+        raise HTTPException(
+            status_code=400,
+            detail="images must be an array"
+        )
+
+    # =========================
+    # 7. Find removed images
+    # =========================
+    removed_images = [
+        image
+        for image in old_images
+        if image not in new_images
+    ]
+
+    # =========================
+    # 8. Delete removed images from R2
+    # =========================
+    for image_url in removed_images:
+
+        try:
+            prefix = "/products/"
+
+            if prefix not in image_url:
+                print(
+                    f"⚠️ Could not determine R2 key: {image_url}"
+                )
+                continue
+
+            r2_key = image_url.split(prefix, 1)[1]
+
+            print(
+                f"🗑️ Deleting R2 image: {r2_key}"
+            )
+
+            delete_from_r2(r2_key)
+
+        except Exception as e:
+
+            print(
+                f"⚠️ Failed to delete R2 image "
+                f"{image_url}: {e}"
+            )
+
+    # =========================
+    # 9. Image count
+    # =========================
+    data["images"] = new_images
+    data["image_count"] = len(new_images)
+
+    # =========================
+    # 10. Update MongoDB
+    # =========================
+    result = await db["products"].update_one(
+        {"_id": product_object_id},
+        {
+            "$set": data
+        }
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+    return {
+        "message": "Product updated successfully",
+        "image_count": len(new_images),
+        "images": new_images
+    }
+
+
+@app.post("/products/{product_id}/add-images")
+async def add_product_images(
+    product_id: str,
+    images: List[UploadFile] = File(...),
+    authorization: str = Header(None)
+):
+    # =============================
+    # Admin Authentication
+    # =============================
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    # =============================
+    # Validate Product ID
+    # =============================
+    try:
+        object_id = ObjectId(product_id)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid product ID"
+        )
+
+    # =============================
+    # Get Product
+    # =============================
+    product = await db["products"].find_one(
+        {"_id": object_id}
+    )
+
+    if not product:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+    # =============================
+    # Existing images
+    # =============================
+    existing_images = product.get("images", [])
+
+    if not isinstance(existing_images, list):
+        existing_images = []
+
+    # =============================
+    # Validate count
+    # =============================
+    if not images:
+        raise HTTPException(
+            status_code=400,
+            detail="No images uploaded"
+        )
+
+    if len(existing_images) + len(images) > 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Maximum 20 images allowed"
+        )
+
+    allowed_types = {
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+        "image/heic",
+        "image/heif"
+    }
+
+    new_image_urls = []
+
+    try:
+
+        # Start numbering after existing images
+        next_index = len(existing_images) + 1
+
+        for image in images:
+
+            if image.content_type not in allowed_types:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file type: {image.filename}"
+                )
+
+            contents = await image.read()
+
+            object_key = (
+                f"products/{product_id}/{next_index}.jpg"
+            )
+
+            print(
+                f"⬆ Uploading new image: {object_key}"
+            )
+
+            upload_to_r2(
+                contents,
+                object_key,
+                "image/jpeg"
+            )
+
+            image_url = (
+                f"{R2_PUBLIC_URL}/{object_key}"
+            )
+
+            new_image_urls.append(image_url)
+
+            next_index += 1
+
+        # =============================
+        # Combine old + new
+        # =============================
+        updated_images = (
+            existing_images + new_image_urls
+        )
+
+        await db["products"].update_one(
+            {"_id": object_id},
+            {
+                "$set": {
+                    "images": updated_images,
+                    "image_count": len(updated_images)
+                }
+            }
+        )
+
+        return {
+            "success": True,
+            "message": "Images added successfully",
+            "productId": product_id,
+            "images": updated_images,
+            "image_count": len(updated_images)
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            f"❌ Failed to add product images: {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to add images"
+        )
+
+    
 
 @app.get("/orders/{order_id}")
 async def get_order(order_id: str, authorization: str = Header(None)):
