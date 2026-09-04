@@ -2279,6 +2279,245 @@ async def add_review(
         print("❌ Error adding review:", e)
         raise HTTPException(status_code=500, detail=f"Review add failed: {str(e)}")
 
+
+# ============================================================
+# ADMIN REPLY TO REVIEW
+# ============================================================
+
+@app.put("/reviews/{review_id}/reply")
+async def reply_to_review(
+    review_id: str,
+    request: Request,
+    authorization: str = Header(None)
+):
+    try:
+
+        # ========================================================
+        # ADMIN AUTHENTICATION
+        # ========================================================
+
+        if authorization != f"Bearer {ADMIN_TOKEN}":
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized"
+            )
+
+
+        # ========================================================
+        # VALIDATE REVIEW ID
+        # ========================================================
+
+        try:
+            review_object_id = ObjectId(review_id)
+
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid review ID"
+            )
+
+
+        # ========================================================
+        # REQUEST BODY
+        # ========================================================
+
+        data = await request.json()
+
+        reply_comment = str(
+            data.get("comment", "")
+        ).strip()
+
+
+        if not reply_comment:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Reply comment is required"
+            )
+
+
+        # ========================================================
+        # FIND REVIEW
+        # ========================================================
+
+        review = await db["reviews"].find_one({
+            "_id": review_object_id
+        })
+
+
+        if not review:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Review not found"
+            )
+
+
+        # ========================================================
+        # SAVE ADMIN REPLY
+        # ========================================================
+
+        admin_reply = {
+            "comment": reply_comment,
+            "createdAt": iso_now()
+        }
+
+
+        await db["reviews"].update_one(
+            {
+                "_id": review_object_id
+            },
+            {
+                "$set": {
+                    "adminReply": admin_reply
+                }
+            }
+        )
+
+
+        # ========================================================
+        # RETURN UPDATED REVIEW
+        # ========================================================
+
+        updated_review = await db["reviews"].find_one({
+            "_id": review_object_id
+        })
+
+        updated_review = fix_id(updated_review)
+
+
+        return {
+            "success": True,
+            "message": "Admin reply added successfully",
+            "review": updated_review
+        }
+
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            "❌ Error replying to review:",
+            e
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reply to review: {str(e)}"
+        )
+
+
+
+# ============================================================
+# ADMIN - GET ALL CUSTOMER REVIEWS
+# ============================================================
+
+@app.get("/admin/reviews")
+async def get_all_reviews(
+    authorization: str = Header(None)
+):
+    try:
+
+        # ========================================================
+        # ADMIN AUTH
+        # ========================================================
+
+        if authorization != f"Bearer {ADMIN_TOKEN}":
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized"
+            )
+
+
+        # ========================================================
+        # GET ALL REVIEWS
+        # ========================================================
+
+        reviews_cursor = db["reviews"].find(
+            {}
+        ).sort(
+            "createdAt",
+            -1
+        )
+
+
+        reviews = []
+
+
+        # ========================================================
+        # GET REVIEWS
+        # ========================================================
+
+        async for review in reviews_cursor:
+
+            review = fix_id(review)
+
+            # --------------------------------------------
+            # Find product name
+            # --------------------------------------------
+
+            product_name = "Unknown Product"
+
+            product_id = review.get("productId")
+
+            if product_id:
+
+                try:
+
+                    product_object_id = ObjectId(
+                        product_id
+                    )
+
+                    product = await db["products"].find_one(
+                        {
+                            "_id": product_object_id
+                        },
+                        {
+                            "name": 1
+                        }
+                    )
+
+                    if product:
+
+                        product_name = product.get(
+                            "name",
+                            "Unknown Product"
+                        )
+
+                except Exception:
+                    pass
+
+
+            # --------------------------------------------
+            # Add product name
+            # --------------------------------------------
+
+            review["productName"] = product_name
+
+
+            reviews.append(review)
+
+
+        return reviews
+
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            "❌ Error loading admin reviews:",
+            e
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to load reviews"
+        )
+
 # =============================
 # shipment charge
 # =============================
