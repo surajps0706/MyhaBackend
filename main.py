@@ -667,6 +667,259 @@ async def get_product(product_id: str):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+
+# =========================================================
+# HOMEPAGE CATEGORY HERO IMAGES
+# =========================================================
+
+@app.get("/homepage/categories")
+async def get_homepage_categories():
+
+    try:
+
+        cursor = db["homepage_categories"].find(
+            {},
+            {
+                "_id": 0,
+                "category": 1,
+                "productId": 1,
+                "imageIndex": 1
+            }
+        )
+
+        settings = []
+
+        async for item in cursor:
+
+            category = item.get("category")
+            product_id = item.get("productId")
+            image_index = int(item.get("imageIndex", 0) or 0)
+
+            hero_image = None
+
+            # ==========================================
+            # Build R2 image URL
+            # ==========================================
+
+            if (
+                product_id
+                and image_index > 0
+                and R2_BASE
+            ):
+
+                hero_image = (
+                    f"{R2_BASE}/products/"
+                    f"{product_id}/"
+                    f"{image_index}.jpg"
+                )
+
+            settings.append({
+                "category": category,
+                "productId": product_id,
+                "imageIndex": image_index,
+                "heroImage": hero_image
+            })
+
+        return settings
+
+    except Exception as e:
+
+        print(
+            "❌ Failed to load homepage categories:",
+            e
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to load homepage settings"
+        )
+
+
+# =========================================================
+# SAVE HOMEPAGE CATEGORY HERO IMAGE
+# =========================================================
+
+@app.put("/homepage/categories/{category}")
+async def save_homepage_category(
+    category: str,
+    request: Request,
+    authorization: str = Header(None)
+):
+
+    # ==========================================
+    # 1. ADMIN AUTHENTICATION
+    # ==========================================
+
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+
+    # ==========================================
+    # 2. READ REQUEST
+    # ==========================================
+
+    data = await request.json()
+
+    product_id = data.get("productId")
+    image_index = data.get("imageIndex")
+
+
+    # ==========================================
+    # 3. VALIDATE PRODUCT ID
+    # ==========================================
+
+    if not product_id:
+
+        raise HTTPException(
+            status_code=400,
+            detail="productId is required"
+        )
+
+    try:
+
+        product_object_id = ObjectId(product_id)
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid productId"
+        )
+
+
+    # ==========================================
+    # 4. VALIDATE IMAGE INDEX
+    # ==========================================
+
+    try:
+
+        image_index = int(image_index)
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=400,
+            detail="imageIndex must be a number"
+        )
+
+
+    if image_index < 1:
+
+        raise HTTPException(
+            status_code=400,
+            detail="imageIndex must be at least 1"
+        )
+
+
+    # ==========================================
+    # 5. VERIFY PRODUCT EXISTS
+    # ==========================================
+
+    product = await db["products"].find_one(
+        {"_id": product_object_id}
+    )
+
+    if not product:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+
+    # ==========================================
+    # 6. VERIFY IMAGE ACTUALLY EXISTS
+    # ==========================================
+
+    image_count = int(
+        product.get("image_count", 0) or 0
+    )
+
+    if image_index > image_count:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid imageIndex. "
+                f"This product has {image_count} images."
+            )
+        )
+
+
+    # ==========================================
+    # 7. VERIFY CATEGORY
+    # ==========================================
+
+    product_category = str(
+        product.get("category", "")
+    ).strip()
+
+    requested_category = category.strip()
+
+
+    if product_category.lower() != requested_category.lower():
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Selected product does not belong "
+                "to the selected category."
+            )
+        )
+
+
+    # ==========================================
+    # 8. SAVE HOMEPAGE SETTING
+    # ==========================================
+
+    await db["homepage_categories"].update_one(
+
+        {
+            "category": requested_category
+        },
+
+        {
+            "$set": {
+                "category": requested_category,
+                "productId": product_id,
+                "imageIndex": image_index,
+                "updatedAt": iso_now()
+            }
+        },
+
+        upsert=True
+    )
+
+
+    # ==========================================
+    # 9. BUILD IMAGE URL FOR RESPONSE
+    # ==========================================
+
+    hero_image = (
+        f"{R2_BASE}/products/"
+        f"{product_id}/"
+        f"{image_index}.jpg"
+    )
+
+
+    return {
+
+        "success": True,
+
+        "category": requested_category,
+
+        "productId": product_id,
+
+        "imageIndex": image_index,
+
+        "heroImage": hero_image
+
+    }
+
 # @app.post("/admin/test-email")
 # async def test_email():
 #     print("🚨 TEST EMAIL ENDPOINT HIT 🚨")
