@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Header, UploadFile, File, Form,APIRouter
+from fastapi import FastAPI, HTTPException, Request, Header, UploadFile, File, Form,APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -7,14 +7,15 @@ from models import ProductCreate
 from pymongo.errors import OperationFailure
 from models import ForgotPasswordRequest, ResetPasswordRequest
 import asyncio
-
+from pydantic import BaseModel
+import re
 
 import boto3
 from botocore.client import Config
 
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone, date
 from models import UserCreate, UserLogin
 from database import users_collection
 import random
@@ -25,6 +26,11 @@ from bson import ObjectId
 
 import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
+import uuid
+
+from fastapi import UploadFile, File, Form, HTTPException
+
+from io import BytesIO
 
 import razorpay
 import os
@@ -244,6 +250,43 @@ def upload_to_r2(file_bytes: bytes, object_key: str, content_type: str = "image/
             "ContentType": content_type
         }
     )
+
+
+
+def upload_exchange_evidence_to_r2(
+    file_bytes: bytes,
+    object_key: str,
+    content_type: str
+) -> str:
+
+    if not file_bytes:
+        raise ValueError("Exchange evidence file is empty.")
+
+    if not object_key or not isinstance(object_key, str):
+        raise ValueError("Exchange evidence object key is invalid.")
+
+    if not content_type:
+        raise ValueError("Exchange evidence content type is invalid.")
+
+    if not R2_BUCKET_NAME:
+        raise RuntimeError("R2 bucket is not configured.")
+
+    if not R2_BASE:
+        raise RuntimeError("R2 public URL is not configured.")
+
+    # Upload using the existing configured R2 client
+    r2_client.upload_fileobj(
+        BytesIO(file_bytes),
+        R2_BUCKET_NAME,
+        object_key,
+        ExtraArgs={
+            "ContentType": content_type
+        }
+    )
+
+    return object_key
+
+
 
 def delete_from_r2(object_key: str):
     r2_client.delete_object(
@@ -590,45 +633,145 @@ def send_order_email(to_email, order_data, is_admin=False):
 # ⭐ Delhivery Tracking Helper
 # =============================
 async def fetch_delhivery_tracking(awb: str):
-    url = f"{DELHIVERY_BASE_URL}/api/v1/packages/json/?waybill={awb}"
+    url = (
+        f"{DELHIVERY_BASE_URL}/api/v1/packages/json/"
+        f"?waybill={awb}"
+    )
+
     headers = {
         "Authorization": f"Token {DELHIVERY_API_TOKEN}",
         "Accept": "application/json"
     }
 
+    # =========================================
+    # 1. Fetch tracking information
+    # =========================================
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers=headers)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                url,
+                headers=headers
+            )
+
+            print(
+                f"[DELHIVERY] HTTP status: "
+                f"{response.status_code}"
+            )
+
             response.raise_for_status()
             data = response.json()
-    except Exception as e:
-        print(f"❌ Delhivery API error: {e}")
+
+    except httpx.HTTPStatusError as exc:
+        print(
+            f"[DELHIVERY] HTTP error: "
+            f"{exc.response.status_code}"
+        )
+        print(
+            f"[DELHIVERY] Response body: "
+            f"{exc.response.text[:1000]}"
+        )
         return []
 
+    except Exception as exc:
+        print(
+            f"[DELHIVERY] API request failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return []
+
+    # =========================================
+    # 2. Validate response structure
+    # =========================================
     timeline = []
+
     try:
         shipment_data = data.get("ShipmentData", [])
-        if shipment_data and "Shipment" in shipment_data[0]:
-            scans = shipment_data[0]["Shipment"].get("Scans", [])
-            for scan in scans:
-                detail = scan.get("ScanDetail", {})
-                status = detail.get("Scan", "")
-                scan_time = detail.get("ScanDateTime")
-                location = detail.get("ScannedLocation")
 
-                # ✅ Track only major statuses
-                if status in ["Picked Up", "In Transit", "Out for Delivery", "Delivered"]:
-                    timeline.append({
-                        "status": status,
-                        "time": scan_time,
-                        "source": "Delhivery",
-                        "location": location
-                    })
-    except Exception as e:
-        print(f"❌ Error parsing Delhivery response: {e}")
+        if not isinstance(shipment_data, list):
+            print(
+                "[DELHIVERY] Unexpected ShipmentData format."
+            )
+            return []
 
-    return timeline
+        if not shipment_data:
+            print(
+                f"[DELHIVERY] No shipment data returned "
+                f"for AWB {awb}"
+            )
+            print(
+                f"[DELHIVERY] Response: {repr(data)[:2000]}"
+            )
+            return []
 
+        shipment = shipment_data[0].get("Shipment", {})
+
+        if not isinstance(shipment, dict):
+            print(
+                "[DELHIVERY] Invalid Shipment structure."
+            )
+            return []
+
+        scans = shipment.get("Scans", [])
+
+        if not isinstance(scans, list):
+            print(
+                "[DELHIVERY] Invalid Scans structure."
+            )
+            return []
+
+        # =========================================
+        # 3. Extract ALL available scan events
+        # =========================================
+        for scan in scans:
+
+            if not isinstance(scan, dict):
+                continue
+
+            detail = scan.get("ScanDetail", {})
+
+            if not isinstance(detail, dict):
+                continue
+
+            status = str(
+                detail.get("Scan", "")
+            ).strip()
+
+            scan_time = detail.get("ScanDateTime")
+
+            location = detail.get("ScannedLocation")
+
+            print(
+                f"[DELHIVERY] AWB={awb}, "
+                f"status={status!r}, "
+                f"time={scan_time!r}"
+            )
+
+            # Do not filter out Manifested or other statuses.
+            # Exchange eligibility is determined separately.
+            if not status:
+                continue
+
+            timeline.append({
+                "status": status,
+                "time": scan_time,
+                "source": "Delhivery",
+                "location": location
+            })
+
+        print(
+            f"[DELHIVERY] Extracted {len(timeline)} "
+            f"tracking events for AWB {awb}"
+        )
+
+        return timeline
+
+    except Exception as exc:
+        print(
+            f"[DELHIVERY] Response parsing failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        return []
 
 # =============================
 # Product APIs
@@ -653,18 +796,41 @@ async def get_products():
 @app.get("/product/{product_id}")
 async def get_product(product_id: str):
     try:
-        product = await db["products"].find_one({"_id": ObjectId(product_id)})
+        if not ObjectId.is_valid(product_id):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid product ID"
+            )
+
+        product = await db["products"].find_one(
+            {"_id": ObjectId(product_id)}
+        )
+
         if not product:
-            raise HTTPException(status_code=404, detail="Product not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Product not found"
+            )
+
         product = fix_id(product)
+
         product["images"] = build_product_image_urls(
             product["id"],
             product.get("image_count", 0)
         )
+
         return product
 
+    except HTTPException:
+        raise
+
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        print(f"Error retrieving product {product_id}: {e}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve product details"
+        )
 
 
 
@@ -1204,6 +1370,7 @@ async def fetch_shipping_charge(destination_pincode: str, weight: int = 500, pt:
         raise HTTPException(status_code=500, detail="Failed to fetch shipping charges")
 
     data = response.json()
+    print("EXCHANGE DELHIVERY RAW RESPONSE:", data)
 
     # Some Delhivery accounts return a list; handle both formats
     if isinstance(data, list) and data:
@@ -2605,4 +2772,3172 @@ async def cancel_order(order_id: str, authorization: str = Header(None)):
         "delhiveryResponse": delhivery_response
     }
 
+class ExchangeOrderValidationRequest(BaseModel):
+    order_id: str
+
+# ==========================================
+# EXCHANGE: VALIDATE ORDER ELIGIBILITY
+# ==========================================
+
+
+
+
+@app.post("/exchange/validate-order")
+async def validate_exchange_order(
+    request: ExchangeOrderValidationRequest
+):
+    # =========================================
+    # 1. Validate Order ID
+    # =========================================
+    order_id = str(request.order_id or "").strip()
+
+    if not order_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter your Order ID."
+        )
+
+    print(f"[EXCHANGE] Requested order ID: {order_id!r}")
+    print(f"[EXCHANGE] Database: {db.name}")
+
+    # =========================================
+    # 2. Find order by string or numeric ID
+    # =========================================
+    order = await db["orders"].find_one(
+        {"orderId": order_id}
+    )
+
+    if not order:
+        try:
+            numeric_id = int(order_id)
+
+            order = await db["orders"].find_one(
+                {"orderId": numeric_id}
+            )
+
+        except ValueError:
+            pass
+
+    if not order:
+        print(
+            f"[EXCHANGE] Order not found: {order_id!r}"
+        )
+
+        raise HTTPException(
+            status_code=404,
+            detail="Order not found. Please check your Order ID."
+        )
+
+    print(
+        f"[EXCHANGE] Matched order ID: "
+        f"{order.get('orderId')!r}"
+    )
+
+    print(
+        f"[EXCHANGE] Order status: "
+        f"{order.get('status')!r}"
+    )
+
+    # =========================================
+    # 3. Validate AWB
+    # =========================================
+    awb = order.get("awb")
+
+    if not awb or not str(awb).strip():
+        print(
+            f"[EXCHANGE] AWB missing for order "
+            f"{order.get('orderId')!r}"
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Tracking information is not available "
+                "for this order yet."
+            )
+        )
+
+    awb = str(awb).strip()
+
+    print(
+        f"[EXCHANGE] Stored AWB: {awb!r}"
+    )
+
+    # =========================================
+    # 4. Fetch live Delhivery tracking
+    # =========================================
+    try:
+        courier_timeline = await fetch_delhivery_tracking(
+            awb
+        )
+
+    except Exception as exc:
+        print(
+            f"[EXCHANGE] Tracking function exception "
+            f"for AWB {awb}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Unable to retrieve delivery information "
+                "right now. Please try again later."
+            )
+        )
+
+    print(
+        "[EXCHANGE] Tracking response type:",
+        type(courier_timeline).__name__
+    )
+
+    print(
+        "[EXCHANGE] Tracking response:",
+        repr(courier_timeline)
+    )
+
+    if not courier_timeline:
+        print(
+            f"[EXCHANGE] Empty tracking response "
+            f"for AWB {awb}"
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Unable to retrieve delivery information "
+                "right now. Please try again later."
+            )
+        )
+
+    # =========================================
+    # 5. Validate tracking response structure
+    # =========================================
+    if not isinstance(courier_timeline, list):
+        print(
+            "[EXCHANGE] Unexpected tracking response "
+            "structure."
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The courier tracking response could not "
+                "be verified. Please contact customer support."
+            )
+        )
+
+    # =========================================
+    # 6. Find actual Delivered scan
+    # =========================================
+    delivered_scans = []
+
+    for scan in courier_timeline:
+
+        if not isinstance(scan, dict):
+            continue
+
+        status = str(
+            scan.get("status", "")
+        ).strip().lower()
+
+        delivered_time = scan.get("time")
+
+        if status == "delivered" and delivered_time:
+            delivered_scans.append(scan)
+
+    if not delivered_scans:
+        print(
+            f"[EXCHANGE] No valid Delivered scan "
+            f"found for AWB {awb}"
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This order has not been confirmed as "
+                "delivered by the courier."
+            )
+        )
+
+    # =========================================
+    # 7. Parse delivery timestamps
+    # =========================================
+    parsed_delivery_times = []
+
+    for scan in delivered_scans:
+
+        raw_time = scan.get("time")
+
+        try:
+            delivered_at = datetime.fromisoformat(
+                str(raw_time)
+                .strip()
+                .replace("Z", "+00:00")
+            )
+
+            # Assume IST for timestamps without a timezone.
+            # Confirm Delhivery's timestamp convention.
+            if delivered_at.tzinfo is None:
+                delivered_at = delivered_at.replace(
+                    tzinfo=timezone(
+                        timedelta(hours=5, minutes=30)
+                    )
+                )
+
+            delivered_at = delivered_at.astimezone(
+                timezone.utc
+            )
+
+            parsed_delivery_times.append(delivered_at)
+
+        except (
+            ValueError,
+            TypeError,
+            AttributeError
+        ) as exc:
+
+            print(
+                f"[EXCHANGE] Invalid delivery timestamp "
+                f"{raw_time!r} for AWB {awb}: {exc}"
+            )
+
+    if not parsed_delivery_times:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The courier's delivery timestamp could "
+                "not be verified. Please contact customer support."
+            )
+        )
+
+    # Use the latest valid Delivered timestamp.
+    delivered_at = max(parsed_delivery_times)
+
+    # =========================================
+    # 8. Calculate seven-day eligibility
+    # =========================================
+    now = datetime.now(timezone.utc)
+
+    age = now - delivered_at
+
+    if age.total_seconds() < 0:
+        print(
+            f"[EXCHANGE] Future delivery timestamp "
+            f"received for AWB {awb}: {delivered_at.isoformat()}"
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The courier returned a future delivery "
+                "timestamp. Please contact customer support."
+            )
+        )
+
+    if age > timedelta(days=7):
+        print(
+            f"[EXCHANGE] Exchange window expired. "
+            f"Order={order.get('orderId')}, "
+            f"Delivered={delivered_at.isoformat()}, "
+            f"AgeDays={age.total_seconds() / 86400:.2f}"
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This order is outside the "
+                "seven-day exchange window."
+            )
+        )
+
+    print(
+        f"[EXCHANGE] Order eligible. "
+        f"Order={order.get('orderId')}, "
+        f"DaysSinceDelivery={age.total_seconds() / 86400:.2f}"
+    )
+
+    # =========================================
+    # 9. Save verified delivery timestamp
+    # =========================================
+    delivered_at_iso = delivered_at.isoformat()
+
+    await db["orders"].update_one(
+        {"_id": order["_id"]},
+        {
+            "$set": {
+                "deliveryConfirmedAt": delivered_at_iso
+            }
+        }
+    )
+
+    # =========================================
+    # 10. Prepare order items
+    # =========================================
+    cart_items = order.get("cartItems") or []
+
+    if not isinstance(cart_items, list) or not cart_items:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No exchangeable items were found "
+                "in this order."
+            )
+        )
+
+    eligible_items = []
+
+    for index, item in enumerate(cart_items):
+
+        if not isinstance(item, dict):
+            continue
+
+        eligible_items.append({
+            "item_index": index,
+            "productId": item.get("productId"),
+            "name": item.get("name"),
+            "quantity": item.get("quantity", 1),
+            "selectedSize": item.get("selectedSize"),
+            "sleeveType": item.get("sleeveType"),
+            "preferredHeight": item.get("preferredHeight"),
+            "neckCustomization": item.get("neckCustomization"),
+            "measurements": item.get("measurements"),
+            "customizationNotes": item.get("customizationNotes")
+        })
+
+    if not eligible_items:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No exchangeable items were found "
+                "in this order."
+            )
+        )
+
+    # =========================================
+    # 11. Return validation result
+    # =========================================
+    return {
+        "eligible": True,
+        "message": "Order is eligible for an exchange request.",
+        "orderId": order.get("orderId"),
+        "deliveryConfirmedAt": delivered_at_iso,
+        "daysSinceDelivery": round(
+            age.total_seconds() / 86400,
+            2
+        ),
+        "items": eligible_items,
+        "checkoutData": order.get("checkoutData") or {},
+    }
+
+@app.get("/exchange/product-by-name")
+async def get_exchange_product_by_name(name: str):
+    name = name.strip()
+
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail="Product name is required."
+        )
+
+    # Case-insensitive exact match
+    products = await db["products"].find(
+        {
+            "name": {
+                "$regex": f"^{re.escape(name)}$",
+                "$options": "i"
+            }
+        }
+    ).to_list(length=2)
+
+    if not products:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found."
+        )
+
+    # Never guess if multiple products share the same name.
+    if len(products) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Multiple products match this name. "
+                "Please contact customer support."
+            )
+        )
+
+    product = fix_id(products[0])
+
+    return {
+        "id": product["id"],
+        "name": product.get("name"),
+        "sizes": product.get("sizes", []),
+        "isSoldOut": product.get("isSoldOut", False)
+    }
+
+# ============================================================
+# EXCHANGE: SUBMIT REQUEST
+# ============================================================
+
+EXCHANGE_EVIDENCE_MAX_BYTES = 25 * 1024 * 1024  # 25 MB per file
+
+EXCHANGE_ALLOWED_EVIDENCE_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "video/mp4",
+    "video/quicktime",
+}
+
+EXCHANGE_ACTIVE_STATUSES = [
+    "Approved",
+    "Pending Review",
+    "Processing",
+]
+
+
+async def find_exchange_order(order_id: str):
+    """
+    Find an order using the same string/numeric order ID logic
+    as the existing exchange validation endpoint.
+    """
+    order = await db["orders"].find_one({
+        "orderId": order_id
+    })
+
+    if not order:
+        try:
+            numeric_id = int(order_id)
+            order = await db["orders"].find_one({
+                "orderId": numeric_id
+            })
+        except ValueError:
+            pass
+
+    return order
+
+
+async def find_exchange_product(item: dict):
+    """
+    Resolve the product referenced by an order item.
+
+    Supports newer orders with productId and legacy orders
+    where productId may be missing or null.
+    """
+    product_id = item.get("productId")
+
+    # Try product ID first.
+    if product_id:
+        try:
+            from bson import ObjectId
+
+            if ObjectId.is_valid(str(product_id)):
+                product = await db["products"].find_one({
+                    "_id": ObjectId(str(product_id))
+                })
+
+                if product:
+                    return product
+
+        except Exception as exc:
+            print(f"Exchange product ID lookup failed: {exc}")
+
+    # Legacy orders may not contain a product ID.
+    product_name = str(item.get("name") or "").strip()
+
+    if not product_name:
+        return None
+
+    # Exact case-insensitive name match.
+    product = await db["products"].find_one({
+        "name": {
+            "$regex": "^" + re.escape(product_name) + "$",
+            "$options": "i"
+        }
+    })
+
+    return product
+
+
+
+
+@app.post("/exchange/submit")
+async def submit_exchange_request(request: Request):
+
+    # ========================================================
+    # 1. Read multipart form data
+    # ========================================================
+
+    form = await request.form()
+
+    order_id = str(form.get("order_id") or "").strip()
+
+    items_raw = form.get("items")
+
+    if not order_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter your Order ID."
+        )
+
+    if not items_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="Please select at least one item."
+        )
+
+    try:
+        exchange_items = json.loads(str(items_raw))
+
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid exchange items data."
+        )
+
+    if not isinstance(exchange_items, list) or not exchange_items:
+        raise HTTPException(
+            status_code=400,
+            detail="Please select at least one item."
+        )
+
+    if len(exchange_items) > 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Too many items selected."
+        )
+
+    # ========================================================
+    # 2. Find order
+    # ========================================================
+
+    order = await find_exchange_order(order_id)
+
+    if not order:
+        raise HTTPException(
+            status_code=404,
+            detail="Order not found. Please check your Order ID."
+        )
+
+
+        # ========================================================
+    # ========================================================
+    # EXCHANGE DELIVERY ADDRESS
+    # ========================================================
+
+    checkout_data = order.get("checkoutData") or {}
+    if not isinstance(checkout_data, dict):
+        checkout_data = {}
+
+    # Read address option. Default to original address for older clients.
+    same_as_original_raw = form.get("same_as_original_address")
+    same_as_original_address = str(
+        same_as_original_raw if same_as_original_raw is not None else "true"
+    ).strip().lower() in ("true", "1", "yes")
+
+    # Original address selected.
+    if same_as_original_address:
+        exchange_address = dict(checkout_data)
+
+    # Different address selected.
+    else:
+        exchange_address_raw = form.get("exchange_address")
+        if not exchange_address_raw:
+            raise HTTPException(
+                status_code=400,
+                detail="Exchange delivery address is required."
+            )
+
+        try:
+            exchange_address = json.loads(str(exchange_address_raw))
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid exchange delivery address."
+            )
+
+        if not isinstance(exchange_address, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Exchange delivery address must be an object."
+            )
+
+    # Normalize both original and new address to the same schema.
+    exchange_address = {
+        "name": str(exchange_address.get("name") or "").strip(),
+        "phone": str(exchange_address.get("phone") or "").strip(),
+        "address": str(
+            exchange_address.get("address")
+            or exchange_address.get("addressLine1")
+            or ""
+        ).strip(),
+        "city": str(exchange_address.get("city") or "").strip(),
+        "state": str(exchange_address.get("state") or "").strip(),
+        "pincode": str(exchange_address.get("pincode") or "").strip()
+    }
+
+    # Validate required address fields.
+    required_address_fields = [
+        "name", "phone", "address", "city", "state", "pincode"
+    ]
+    for field in required_address_fields:
+        if not exchange_address.get(field):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Exchange delivery {field} is required."
+            )
+
+    # Validate pincode.
+    if not re.fullmatch(r"\d{6}", exchange_address["pincode"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Exchange delivery pincode must contain 6 digits."
+        )
+
+    # Validate phone.
+    if not re.fullmatch(r"\d{10}", exchange_address["phone"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Exchange delivery phone must contain 10 digits."
+        )
+
+    # 3. Validate delivery eligibility
+    # ========================================================
+
+    validation = await validate_exchange_order(
+        ExchangeOrderValidationRequest(order_id=order_id)
+    )
+
+    if not validation or not validation.get("eligible"):
+        raise HTTPException(
+            status_code=400,
+            detail="This order is not eligible for an exchange."
+        )
+
+    # ========================================================
+    # 4. Get order items
+    # ========================================================
+
+    cart_items = order.get("cartItems") or []
+
+    if not isinstance(cart_items, list):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid order items."
+        )
+
+    order_items_by_index = {
+        index: item
+        for index, item in enumerate(cart_items)
+    }
+
+    # ========================================================
+    # 5. Validate selected items
+    # ========================================================
+
+    processed_items = []
+
+    selected_indices = set()
+
+    has_size_exchange = False
+
+    total_evidence_bytes = 0
+
+    for position, exchange_item in enumerate(exchange_items):
+
+        if not isinstance(exchange_item, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid exchange item data."
+            )
+
+        # ----------------------------------------------------
+        # Item index
+        # ----------------------------------------------------
+
+        try:
+            item_index = int(exchange_item.get("item_index"))
+
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid order item."
+            )
+
+        if item_index < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid order item."
+            )
+
+        if item_index in selected_indices:
+            raise HTTPException(
+                status_code=400,
+                detail="The same item cannot be selected twice."
+            )
+
+        selected_indices.add(item_index)
+
+        if item_index not in order_items_by_index:
+            raise HTTPException(
+                status_code=400,
+                detail="The selected item was not found in this order."
+            )
+
+        item = order_items_by_index[item_index]
+
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="The selected order item is invalid."
+            )
+
+        # ----------------------------------------------------
+        # Reason
+        # ----------------------------------------------------
+
+        reason = str(
+            exchange_item.get("reason") or ""
+        ).strip().lower()
+
+        if reason not in {
+            "size_issue",
+            "defective_product"
+        }:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid exchange reason."
+            )
+
+        # ----------------------------------------------------
+        # Prevent duplicate active exchange requests
+        # ----------------------------------------------------
+
+        existing_request = await db["exchange_requests"].find_one({
+            "order_id": order.get("orderId"),
+            "item_index": item_index,
+            "status": {
+                "$in": EXCHANGE_ACTIVE_STATUSES
+            }
+        })
+
+        if existing_request:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"An active exchange request already exists "
+                    f"for item {item_index + 1}."
+                )
+            )
+
+        # ----------------------------------------------------
+        # Item-specific values
+        # ----------------------------------------------------
+
+        selected_replacement_size = None
+
+        evidence_urls = []
+
+        item_status = None
+
+        # ====================================================
+        # 6. SIZE EXCHANGE
+        # ====================================================
+
+        if reason == "size_issue":
+
+            replacement_size = str(
+                exchange_item.get("replacement_size") or ""
+            ).strip()
+
+            if not replacement_size:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Please select a replacement size "
+                        f"for item {item_index + 1}."
+                    )
+                )
+
+            current_size = str(
+                item.get("selectedSize") or ""
+            ).strip()
+
+            if replacement_size.lower() == current_size.lower():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Please select a different size "
+                        f"for item {item_index + 1}."
+                    )
+                )
+
+            # ------------------------------------------------
+            # Find original product
+            # ------------------------------------------------
+
+            product = await find_exchange_product(item)
+
+            if not product:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Could not identify the product "
+                        f"for item {item_index + 1}."
+                    )
+                )
+
+            if product.get("isSoldOut") is True:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Product for item {item_index + 1} "
+                        f"is currently sold out."
+                    )
+                )
+
+            # ------------------------------------------------
+            # Validate replacement size
+            # ------------------------------------------------
+
+            product_sizes = product.get("sizes") or []
+
+            matching_size = None
+
+            for size in product_sizes:
+
+                if not isinstance(size, dict):
+                    continue
+
+                if (
+                    str(size.get("label", "")).strip().lower()
+                    == replacement_size.lower()
+                ):
+                    matching_size = size
+                    break
+
+            if not matching_size:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"The selected size is unavailable "
+                        f"for item {item_index + 1}."
+                    )
+                )
+
+            if matching_size.get("available") is not True:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"The selected size is currently unavailable "
+                        f"for item {item_index + 1}."
+                    )
+                )
+
+            selected_replacement_size = replacement_size
+
+            item_status = "Payment Pending"
+
+            has_size_exchange = True
+
+        # ====================================================
+        # 7. DEFECTIVE PRODUCT
+        # ====================================================
+
+        else:
+
+            # Frontend sends evidence_0, evidence_1, etc.
+            # Position corresponds to the item in the submitted
+            # JSON array, NOT the original order item index.
+
+            evidence_field_name = f"evidence_{position}"
+
+            uploaded_file = form.get(evidence_field_name)
+
+            uploaded_files = []
+
+            if (
+                uploaded_file is not None
+                and hasattr(uploaded_file, "filename")
+                and hasattr(uploaded_file, "read")
+                and uploaded_file.filename
+            ):
+                uploaded_files.append(uploaded_file)
+
+            if not uploaded_files:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Please upload evidence "
+                        f"for item {item_index + 1}."
+                    )
+                )
+
+            if len(uploaded_files) > 5:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Maximum 5 evidence files per item."
+                )
+
+            # ------------------------------------------------
+            # Upload evidence
+            # ------------------------------------------------
+
+            for file in uploaded_files:
+
+                content_type = (
+                    file.content_type or ""
+                ).lower()
+
+                if content_type not in EXCHANGE_ALLOWED_EVIDENCE_TYPES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Unsupported evidence format. "
+                            "Use JPG, PNG, WEBP, MP4, or MOV."
+                        )
+                    )
+
+                file_bytes = await file.read()
+
+                if not file_bytes:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"The file {file.filename} is empty."
+                    )
+
+                if len(file_bytes) > EXCHANGE_EVIDENCE_MAX_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"{file.filename} exceeds "
+                            "the 25 MB per-file limit."
+                        )
+                    )
+
+                total_evidence_bytes += len(file_bytes)
+
+                if total_evidence_bytes > 50 * 1024 * 1024:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "Combined evidence cannot exceed 50 MB."
+                        )
+                    )
+
+                extension_by_type = {
+                    "image/jpeg": ".jpg",
+                    "image/png": ".png",
+                    "image/webp": ".webp",
+                    "video/mp4": ".mp4",
+                    "video/quicktime": ".mov",
+                }
+
+                extension = extension_by_type[content_type]
+
+                evidence_key = (
+                    f"exchange-evidence/"
+                    f"{uuid.uuid4().hex}{extension}"
+                )
+
+                try:
+
+                    upload_exchange_evidence_to_r2(
+                        file_bytes,
+                        evidence_key,
+                        content_type
+                    )
+
+                except Exception as exc:
+
+                    print(
+                        f"Exchange evidence upload failed: {exc}"
+                    )
+
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            "Unable to upload evidence right now. "
+                            "Please try again."
+                        )
+                    )
+
+                if not R2_BASE:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "Evidence storage is not configured correctly."
+                        )
+                    )
+
+                evidence_urls.append(
+                    f"{R2_BASE.rstrip('/')}/{evidence_key}"
+                )
+
+            item_status = "Pending Review"
+
+        # ====================================================
+        # 8. Add item to grouped request
+        # ====================================================
+
+        processed_items.append({
+
+            "item_index": item_index,
+
+            "productId": item.get("productId"),
+
+            "productName": item.get("name"),
+
+            "quantity": item.get("quantity", 1),
+
+            "originalSize": item.get("selectedSize"),
+
+            "replacementSize": selected_replacement_size,
+
+            "reason": reason,
+
+            "status": item_status,
+
+            "evidence": evidence_urls,
+
+            "adminNotes": None,
+
+            "resolution": None,
+
+        })
+
+    # ========================================================
+    # 9. Determine grouped status
+    # ========================================================
+
+    if has_size_exchange:
+
+        request_status = "Payment Pending"
+
+        payment_status = "Pending"
+
+        message = (
+            "Your exchange request has been created. "
+            "Please complete the exchange payment."
+        )
+
+    else:
+
+        request_status = "Pending Review"
+
+        payment_status = None
+
+        message = (
+            "Your exchange request has been submitted "
+            "for admin review."
+        )
+
+    # ========================================================
+    # 10. Create grouped request
+    # ========================================================
+
+    request_id = (
+        f"EX-{uuid.uuid4().hex[:12].upper()}"
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    exchange_document = {
+
+        "requestId": request_id,
+
+        "order_id": order.get("orderId"),
+
+        "order_mongo_id": str(order.get("_id")),
+
+        "exchangeAddress": exchange_address,
+
+# Address selection
+        "sameAsOriginalAddress": same_as_original_address,
+
+        # All selected dresses are stored together.
+        "items": processed_items,
+
+        # Group status.
+        "status": request_status,
+
+        # Payment fields.
+        "paymentStatus": payment_status,
+
+        "paymentAmount": None,
+
+        "razorpayOrderId": None,
+
+        "razorpayPaymentId": None,
+
+        "razorpaySignature": None,
+
+        "paymentVerifiedAt": None,
+
+        "createdAt": now,
+
+        "updatedAt": now,
+
+        "deliveryConfirmedAt": validation.get(
+            "deliveryConfirmedAt"
+        ),
+
+        "adminNotes": None,
+
+        "resolution": None,
+
+    }
+
+    # ========================================================
+    # 11. Insert grouped request
+    # ========================================================
+
+    await db["exchange_requests"].insert_one(
+        exchange_document
+    )
+
+    # ========================================================
+    # 12. Return grouped response
+    # ========================================================
+
+    return {
+        "success": True,
+        "message": message,
+        "requestId": request_id,
+        "status": request_status,
+        "items": processed_items,
+    }
+
+
+
+
+
+# ============================================================
+# EXCHANGE: SUBMIT REQUEST
+# Place below validate_exchange_order() in main.py
+# ============================================================
+
+EXCHANGE_ACTIVE_STATUSES = [
+    "Approved",
+    "Pending Review",
+    "Processing",
+]
+
+EXCHANGE_MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB per file
+EXCHANGE_MAX_TOTAL_SIZE = 50 * 1024 * 1024  # 50 MB total
+
+EXCHANGE_ALLOWED_TYPES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+}
+
+# ============================================================
+# EXCHANGE CONFIGURATION
+# ============================================================
+
+EXCHANGE_ADMIN_STATUSES = {
+    "Pending Review",
+    "Approved",
+    "Processing",
+    "Completed",
+    "Rejected"
+}
+
+
+# @app.post("/exchange/submit")
+# async def submit_exchange_request(
+#     order_id: str = Form(...),
+#     item_index: int = Form(...),
+#     reason: str = Form(...),
+#     replacement_size: Optional[str] = Form(None),
+#     evidence: Optional[List[UploadFile]] = File(None),
+# ):
+#     order_id = order_id.strip()
+#     reason = reason.strip().lower()
+
+#     if not order_id:
+#         raise HTTPException(400, "Please enter your Order ID.")
+
+#     if reason not in {"size_issue", "defective_product"}:
+#         raise HTTPException(400, "Invalid exchange reason.")
+
+#     if item_index < 0:
+#         raise HTTPException(400, "Invalid order item.")
+
+#     # 1. Find the order using the same ID logic as validation.
+#     order = await db["orders"].find_one({"orderId": order_id})
+
+#     if not order:
+#         try:
+#             order = await db["orders"].find_one({
+#                 "orderId": int(order_id)
+#             })
+#         except ValueError:
+#             pass
+
+#     if not order:
+#         raise HTTPException(
+#             status_code=404,
+#             detail="Order not found. Please check your Order ID."
+#         )
+
+#     # 2. Recheck live Delhivery delivery and the 7-day window.
+#     # This invokes your existing validation function.
+#     validation = await validate_exchange_order(
+#         ExchangeOrderValidationRequest(order_id=order_id)
+#     )
+
+#     if not validation.get("eligible"):
+#         raise HTTPException(
+#             status_code=400,
+#             detail="This order is not eligible for an exchange."
+#         )
+
+#     # 3. Validate the selected item.
+#     cart_items = order.get("cartItems") or []
+
+#     if item_index >= len(cart_items):
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Selected item was not found in this order."
+#         )
+
+#     item = cart_items[item_index]
+
+#     if not isinstance(item, dict):
+#         raise HTTPException(400, "Invalid order item.")
+
+#     # 4. Prevent duplicate active requests for this item.
+#     existing = await db["exchange_requests"].find_one({
+#         "order_id": order.get("orderId"),
+#         "item_index": item_index,
+#         "status": {"$in": EXCHANGE_ACTIVE_STATUSES},
+#     })
+
+#     if existing:
+#         raise HTTPException(
+#             status_code=409,
+#             detail="An active exchange request already exists for this item."
+#         )
+
+#     replacement = None
+#     evidence_keys = []
+
+#     # 5. SIZE EXCHANGE
+#     if reason == "size_issue":
+#         replacement = (replacement_size or "").strip()
+
+#         if not replacement:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="Please select a replacement size."
+#             )
+
+#         current_size = str(item.get("selectedSize") or "").strip()
+
+#         if replacement.casefold() == current_size.casefold():
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="Choose a size different from your current size."
+#             )
+
+#         # Resolve product by ID first, then exact name for legacy orders.
+#         product = None
+#         product_id = item.get("productId")
+
+#         if product_id:
+#             try:
+#                 from bson import ObjectId
+
+#                 if ObjectId.is_valid(str(product_id)):
+#                     product = await db["products"].find_one({
+#                         "_id": ObjectId(str(product_id))
+#                     })
+#             except Exception as exc:
+#                 print("[EXCHANGE] Product ID lookup error:", exc)
+
+#         if not product:
+#             product_name = str(item.get("name") or "").strip()
+
+#             if product_name:
+#                 product = await db["products"].find_one({
+#                     "name": {
+#                         "$regex": "^" + re.escape(product_name) + "$",
+#                         "$options": "i",
+#                     }
+#                 })
+
+#         if not product:
+#             raise HTTPException(
+#                 status_code=409,
+#                 detail="Unable to identify the original product safely."
+#             )
+
+#         # Your actual Product model uses sizes: List[str].
+#         available_sizes = product.get("sizes") or []
+
+#         if not any(
+#             isinstance(size, str)
+#             and size.strip().casefold() == replacement.casefold()
+#             for size in available_sizes
+#         ):
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="That size is not listed for this product."
+#             )
+
+#         if product.get("isSoldOut") is True:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="This product is currently sold out."
+#             )
+
+#         if product.get("stock") is not None:
+#             try:
+#                 if int(product["stock"]) <= 0:
+#                     raise HTTPException(
+#                         status_code=400,
+#                         detail="This product is currently out of stock."
+#                     )
+#             except (ValueError, TypeError):
+#                 raise HTTPException(
+#                     status_code=409,
+#                     detail="Product stock information is invalid."
+#                 )
+
+#         # NOTE: Your schema does not track stock per size.
+#         # This confirms the size is listed and the product is not sold
+#         # out, but cannot guarantee that this particular size is in stock.
+
+#         status = "Payment Pending"
+
+#     # 6. DEFECTIVE PRODUCT
+#     else:
+#         files = [
+#             file for file in (evidence or [])
+#             if file and file.filename
+#         ]
+
+#         if not files:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="Upload at least one photo or video of the defect."
+#             )
+
+#         if len(files) > 5:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="You can upload a maximum of 5 evidence files."
+#             )
+
+#         # Read and validate all files before uploading any of them.
+#         prepared_files = []
+#         total_size = 0
+
+#         for file in files:
+#             content_type = (file.content_type or "").lower()
+
+#             if content_type not in EXCHANGE_ALLOWED_TYPES:
+#                 raise HTTPException(
+#                     status_code=400,
+#                     detail="Use JPG, PNG, WEBP, MP4, or MOV evidence files."
+#                 )
+
+#             data = await file.read()
+
+#             if not data:
+#                 raise HTTPException(
+#                     status_code=400,
+#                     detail=f"{file.filename} is empty."
+#                 )
+
+#             if len(data) > EXCHANGE_MAX_FILE_SIZE:
+#                 raise HTTPException(
+#                     status_code=413,
+#                     detail=f"{file.filename} exceeds 25 MB."
+#                 )
+
+#             total_size += len(data)
+
+#             prepared_files.append(
+#                 (data, content_type, EXCHANGE_ALLOWED_TYPES[content_type])
+#             )
+
+#         if total_size > EXCHANGE_MAX_TOTAL_SIZE:
+#             raise HTTPException(
+#                 status_code=413,
+#                 detail="Combined evidence cannot exceed 50 MB."
+#             )
+
+#         # Upload using your existing R2 helper.
+#         # Store object keys because upload_to_r2() does not return URLs.
+#         for data, content_type, extension in prepared_files:
+#             object_key = (
+#                 f"exchange-evidence/{uuid.uuid4().hex}{extension}"
+#             )
+
+#             try:
+#                 upload_to_r2(data, object_key, content_type)
+#                 evidence_keys.append(object_key)
+#             except Exception as exc:
+#                 print("[EXCHANGE] R2 upload failed:", exc)
+
+#                 raise HTTPException(
+#                     status_code=502,
+#                     detail="Evidence upload failed. Please try again."
+#                 )
+
+#         status = "Pending Review"
+
+#     # 7. Create a separate exchange record.
+#     now = datetime.now(timezone.utc).isoformat()
+#     request_id = f"EX-{uuid.uuid4().hex[:12].upper()}"
+
+#     exchange_record = {
+#         "requestId": request_id,
+#         "order_id": order.get("orderId"),
+#         "order_mongo_id": str(order["_id"]),
+#         "item_index": item_index,
+#         "productId": item.get("productId"),
+#         "productName": item.get("name"),
+#         "quantity": item.get("quantity", 1),
+#         "originalSize": item.get("selectedSize"),
+#         "replacementSize": replacement,
+#         "reason": reason,
+#         "status": status,
+
+#         # Exchange payment details
+#         "paymentStatus": (
+#             "Pending" if reason == "size_issue" else "Not Required"
+#         ),
+#         "paymentAmount": 0,
+#         "razorpayOrderId": None,
+#         "razorpayPaymentId": None,
+#         "paymentVerifiedAt": None,
+
+#         "evidenceKeys": evidence_keys,
+#         "deliveryConfirmedAt": validation.get("deliveryConfirmedAt"),
+#         "createdAt": now,
+#         "updatedAt": now,
+#         "adminNotes": None,
+#         "resolution": None,
+#     }
+
+#     await db["exchange_requests"].insert_one(exchange_record)
+
+#     return {
+#         "success": True,
+#         "message": (
+#             "Your size exchange request has been approved."
+#             "Please complete the exchange shipping payment."
+#             if reason == "size_issue"
+#             else "Your defective-product request has been submitted for review."
+#         ),
+#         "requestId": request_id,
+#         "status": status,
+#     }
+
+
+# ============================================================
+# ADMIN: ACTIVE EXCHANGE COUNT
+# ============================================================
+
+@app.get("/admin/exchanges/count")
+async def get_admin_exchange_count(
+    authorization: str = Header(None)
+):
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    active_statuses = [
+        "Pending Review",
+        "Approved",
+        "Processing"
+    ]
+
+    count = await db["exchange_requests"].count_documents({
+        "status": {"$in": active_statuses}
+    })
+
+    return {"count": count}
+
+
+
+# ============================================================
+# ADMIN: GET EXCHANGE REQUESTS
+# ============================================================
+
+
+@app.get("/admin/exchanges")
+async def get_admin_exchanges(
+    authorization: str = Header(None)
+):
+
+    # ========================================================
+    # ADMIN AUTHENTICATION
+    # ========================================================
+
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    # ========================================================
+    # HELPER: CONVERT MONGODB VALUES TO JSON-SAFE VALUES
+    # ========================================================
+
+    def serialize_mongodb_value(value):
+
+        from bson import ObjectId
+
+        if isinstance(value, ObjectId):
+
+            return str(value)
+
+        if isinstance(value, (datetime, date)):
+
+            return value.isoformat()
+
+        if isinstance(value, dict):
+
+            return {
+                str(key): serialize_mongodb_value(item)
+                for key, item in value.items()
+            }
+
+        if isinstance(value, (list, tuple)):
+
+            return [
+                serialize_mongodb_value(item)
+                for item in value
+            ]
+
+        return value
+
+    # ========================================================
+    # RETRIEVE EXCHANGE REQUESTS
+    # ========================================================
+
+    exchanges = await db["exchange_requests"].find(
+        {}
+    ).sort(
+        "createdAt", -1
+    ).to_list(
+        length=100
+    )
+
+    result = []
+
+    # ========================================================
+    # PROCESS EACH EXCHANGE
+    # ========================================================
+
+    for exchange in exchanges:
+
+        # Hide size-exchange requests until payment is verified.
+# The request remains in MongoDB so the customer can retry payment.
+
+        exchange_items = exchange.get("items") or []
+
+        has_size_exchange = any(
+            isinstance(item, dict)
+            and item.get("reason") == "size_issue"
+            for item in exchange_items
+        )
+
+        if (
+            has_size_exchange
+            and exchange.get("paymentStatus") != "Paid"
+        ):
+            continue
+
+        # ====================================================
+        # FIND ORIGINAL ORDER
+        # ====================================================
+
+        order = None
+
+        order_mongo_id = exchange.get(
+            "order_mongo_id"
+        )
+
+        # ----------------------------------------------------
+        # FIND ORDER USING MONGODB OBJECT ID
+        # ----------------------------------------------------
+
+        if order_mongo_id:
+
+            try:
+
+                from bson import ObjectId
+
+                if ObjectId.is_valid(
+                    str(order_mongo_id)
+                ):
+
+                    order = await db["orders"].find_one({
+                        "_id": ObjectId(
+                            str(order_mongo_id)
+                        )
+                    })
+
+            except Exception as exc:
+
+                print(
+                    "[EXCHANGE] Order MongoDB ID lookup error:",
+                    exc
+                )
+
+        # ----------------------------------------------------
+        # FALLBACK: FIND ORDER USING ORDER ID
+        # ----------------------------------------------------
+
+        if not order:
+
+            order_id = exchange.get(
+                "order_id"
+            )
+
+            if order_id:
+
+                order = await db["orders"].find_one({
+                    "orderId": order_id
+                })
+
+            # ------------------------------------------------
+            # FALLBACK: ORDER ID STORED AS INTEGER
+            # ------------------------------------------------
+
+            if not order and order_id:
+
+                try:
+
+                    order = await db["orders"].find_one({
+                        "orderId": int(order_id)
+                    })
+
+                except (ValueError, TypeError):
+
+                    pass
+
+        # ====================================================
+        # CUSTOMER INFORMATION
+        # ====================================================
+
+        customer_name = None
+
+        customer_email = None
+
+        customer_phone = None
+
+        customer_id = None
+
+        shipping_address = None
+
+        billing_address = None
+
+        checkout_data = {}
+
+        if order:
+
+            # ------------------------------------------------
+            # GET CHECKOUT DATA
+            # ------------------------------------------------
+
+            checkout_data = order.get(
+                "checkoutData"
+            ) or {}
+
+            if not isinstance(checkout_data, dict):
+
+                checkout_data = {}
+
+            # ------------------------------------------------
+            # CUSTOMER NAME
+            # ------------------------------------------------
+
+            customer_name = (
+                checkout_data.get("name")
+                or order.get("customerName")
+                or order.get("name")
+                or order.get("fullName")
+            )
+
+            # ------------------------------------------------
+            # CUSTOMER EMAIL
+            # ------------------------------------------------
+
+            customer_email = (
+                checkout_data.get("email")
+                or order.get("email")
+                or order.get("customerEmail")
+            )
+
+            # ------------------------------------------------
+            # CUSTOMER PHONE
+            # ------------------------------------------------
+
+            customer_phone = (
+                checkout_data.get("phone")
+                or order.get("phone")
+                or order.get("mobile")
+                or order.get("customerPhone")
+            )
+
+            # ------------------------------------------------
+            # CUSTOMER ID
+            # ------------------------------------------------
+
+            customer_id = order.get(
+                "userId"
+            )
+
+            # ------------------------------------------------
+            # SHIPPING ADDRESS
+            # ------------------------------------------------
+
+            shipping_address = (
+                checkout_data.get("address")
+                or order.get("shippingAddress")
+                or order.get("address")
+            )
+
+            # ------------------------------------------------
+            # BILLING ADDRESS
+            # ------------------------------------------------
+
+            billing_address = (
+                order.get("billingAddress")
+                or order.get("billing_address")
+            )
+
+            # ------------------------------------------------
+            # BUILD ADDRESS FROM CHECKOUT DATA IF NEEDED
+            # ------------------------------------------------
+
+            if not shipping_address:
+
+                address_parts = [
+
+                    checkout_data.get("addressLine1"),
+
+                    checkout_data.get("addressLine2"),
+
+                    checkout_data.get("city"),
+
+                    checkout_data.get("state"),
+
+                    checkout_data.get("pincode")
+
+                ]
+
+                address_parts = [
+
+                    str(part).strip()
+
+                    for part in address_parts
+
+                    if part and str(part).strip()
+
+                ]
+
+                if address_parts:
+
+                    shipping_address = ", ".join(
+                        address_parts
+                    )
+
+        # ====================================================
+        # CUSTOMER DETAILS
+        # ====================================================
+
+        customer_details = {
+
+            "id": customer_id,
+
+            "customerId": customer_id,
+
+            "name": customer_name,
+
+            "email": customer_email,
+
+            "phone": customer_phone,
+
+            "shippingAddress": shipping_address,
+
+            "billingAddress": billing_address
+
+        }
+
+        # ====================================================
+        # ORIGINAL ORDER DETAILS
+        # ====================================================
+
+        order_details = None
+
+        if order:
+
+            order_details = serialize_mongodb_value(
+                order
+            )
+
+        # ====================================================
+# EXCHANGE ITEM DETAILS
+# ====================================================
+
+        exchange_items = exchange.get("items") or []
+
+# Support older exchange records that stored one item at root level
+        if not exchange_items:
+            exchange_items = [{
+                "item_index": exchange.get("item_index"),
+                "productId": exchange.get("productId"),
+            "productName": exchange.get("productName"),
+            "quantity": exchange.get("quantity", 1),
+            "originalSize": exchange.get("originalSize"),
+            "replacementSize": exchange.get("replacementSize"),
+            "reason": exchange.get("reason"),
+            "status": exchange.get("status"),
+            "evidence": exchange.get("evidence", [])
+        }]
+
+# Ensure items is always an array of actual item objects
+        exchange_items = [
+            item for item in exchange_items
+            if isinstance(item, dict)
+        ]
+
+# First item for backward compatibility
+        exchange_item = exchange_items[0] if exchange_items else {}
+        # ====================================================
+        # EXCHANGE RECORD
+        # ====================================================
+
+        exchange_result = {
+
+            # ------------------------------------------------
+            # EXCHANGE IDENTIFICATION
+            # ------------------------------------------------
+
+            "requestId": exchange.get(
+                "requestId"
+            ),
+
+            "order_id": exchange.get(
+                "order_id"
+            ),
+
+            "orderId": (
+
+                order.get("orderId")
+
+                if order
+
+                else exchange.get("order_id")
+
+            ),
+
+
+
+            "order_mongo_id": exchange.get(
+                "order_mongo_id"
+            ),
+
+            # ------------------------------------------------
+            # EXCHANGE ITEM
+            # ------------------------------------------------
+
+            "item_index": exchange.get(
+                "item_index"
+            ),
+
+            "productId": exchange.get(
+                "productId"
+            ),
+
+            "productName": exchange.get(
+                "productName"
+            ),
+
+            "quantity": exchange.get(
+                "quantity",
+                1
+            ),
+
+            "originalSize": exchange.get(
+                "originalSize"
+            ),
+
+            "replacementSize": exchange.get(
+                "replacementSize"
+            ),
+
+            "reason": exchange.get(
+                "reason"
+            ),
+
+            "paymentStatus": exchange.get("paymentStatus"),
+            "paymentAmount": exchange.get("paymentAmount"),
+            "razorpayOrderId": exchange.get("razorpayOrderId"),
+            "razorpayPaymentId": exchange.get("razorpayPaymentId"),
+
+            # ====================================================
+# EXCHANGE ADDRESS
+# ====================================================
+
+            "exchangeAddress": exchange.get("exchangeAddress"),
+
+            "sameAsOriginalAddress": exchange.get(
+                "sameAsOriginalAddress",
+                True
+            ),
+
+            # ------------------------------------------------
+            # EXCHANGE STATUS
+            # ------------------------------------------------
+
+            "status": exchange.get(
+                "status"
+            ),
+
+            "adminNotes": exchange.get(
+                "adminNotes"
+            ),
+
+            "resolution": exchange.get(
+                "resolution"
+            ),
+
+            # ------------------------------------------------
+            # EVIDENCE
+            # ------------------------------------------------
+
+            "evidenceKeys": exchange.get(
+                "evidenceKeys",
+                exchange.get("evidence", [])
+            ),
+
+            # ------------------------------------------------
+            # DELIVERY
+            # ------------------------------------------------
+
+            "deliveryConfirmedAt": exchange.get(
+                "deliveryConfirmedAt"
+            ),
+
+            # ------------------------------------------------
+            # EXCHANGE TIMESTAMPS
+            # ------------------------------------------------
+
+            "createdAt": exchange.get(
+                "createdAt"
+            ),
+
+            "updatedAt": exchange.get(
+                "updatedAt"
+            ),
+
+            # ------------------------------------------------
+            # CUSTOMER DETAILS
+            # ------------------------------------------------
+
+            "customer": customer_details,
+
+            # ------------------------------------------------
+            # CUSTOMER DETAILS - ANGULAR COMPATIBILITY
+            # ------------------------------------------------
+
+            "customerId": customer_id,
+
+            "customerName": customer_name,
+
+            "customerEmail": customer_email,
+
+            "customerPhone": customer_phone,
+
+            "shippingAddress": shipping_address,
+
+            "billingAddress": billing_address,
+
+            # ------------------------------------------------
+            # ORIGINAL ORDER DETAILS
+            # ------------------------------------------------
+
+            "orderDetails": order_details,
+
+            # ------------------------------------------------
+            # EXCHANGE ITEM DETAILS
+            # ------------------------------------------------
+
+            "exchangeItem": exchange_item,
+
+            "items": exchange_items,
+
+            # Angular compatibility
+            "exchangeItems": exchange_items
+
+        }
+
+        # ====================================================
+        # SERIALIZE COMPLETE RESPONSE
+        # ====================================================
+
+        exchange_result = serialize_mongodb_value(
+            exchange_result
+        )
+
+        # ====================================================
+        # ADD EXCHANGE TO RESULT
+        # ====================================================
+
+        result.append(
+            exchange_result
+        )
+
+    # ========================================================
+    # RETURN ADMIN EXCHANGE RESPONSE
+    # ========================================================
+
+    return {
+
+        "success": True,
+
+        "count": len(result),
+
+        "exchanges": result
+
+    }
+
+
+# ============================================================
+# ADMIN: UPDATE staus of the order
+# ============================================================
+
+@app.patch("/admin/exchanges/{request_id}/complete")
+async def complete_exchange(
+    request_id: str,
+    authorization: str = Header(None)
+):
+    # Admin authentication
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    # Find the exchange request
+    exchange = await db["exchange_requests"].find_one({
+        "requestId": request_id
+    })
+
+    if not exchange:
+        raise HTTPException(
+            status_code=404,
+            detail="Exchange request not found"
+        )
+
+    current_status = str(
+        exchange.get("status") or ""
+    ).strip().lower()
+
+    # Prevent duplicate completion
+    if current_status == "completed":
+        return {
+            "success": True,
+            "message": "Exchange is already completed"
+        }
+
+    # Update exchange status
+    now = datetime.now(timezone.utc)
+
+    result = await db["exchange_requests"].update_one(
+        {
+            "_id": exchange["_id"],
+            "status": exchange.get("status")
+        },
+        {
+            "$set": {
+                "status": "Completed",
+                "completedAt": now,
+                "updatedAt": now
+            }
+        }
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Exchange status changed. Please refresh and try again."
+        )
+
+    return {
+        "success": True,
+        "message": "Exchange marked as completed",
+        "requestId": request_id,
+        "status": "Completed",
+        "completedAt": now.isoformat()
+    }
+
+# ============================================================
+# ADMIN: UPDATE EXCHANGE STATUS
+# ============================================================
+
+class ExchangeStatusUpdateRequest(BaseModel):
+    status: str
+    adminNotes: Optional[str] = None
+
+@app.patch("/admin/exchanges/{request_id}/status")
+async def update_exchange_status(
+    request_id: str,
+    request: ExchangeStatusUpdateRequest,
+    authorization: str = Header(None)
+):
+
+    # Admin authentication
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    # Validate status
+    new_status = request.status.strip()
+
+    if new_status not in EXCHANGE_ADMIN_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid exchange status."
+        )
+
+    # Find exchange request
+    exchange = await db["exchange_requests"].find_one({
+        "requestId": request_id
+    })
+
+    if not exchange:
+        raise HTTPException(
+            status_code=404,
+            detail="Exchange request not found."
+        )
+
+
+    # ========================================================
+# PREVENT APPROVAL / FULFILLMENT BEFORE REQUIRED PAYMENT
+# ========================================================
+
+    items = exchange.get("items") or []
+
+    has_size_exchange = any(
+        isinstance(item, dict)
+        and item.get("reason") == "size_issue"
+        for item in items
+    )
+
+# Size exchanges must be paid before admin approval.
+    if has_size_exchange:
+
+        if new_status in {
+            "Approved",
+            "Processing",
+            "Packed",
+            "Shipped",
+            "Delivered",
+            "Completed"
+        } and exchange.get("paymentStatus") != "Paid":
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This size exchange cannot be approved or processed "
+                    "until its payment has been verified."
+                )
+            )
+
+
+    # Preserve existing notes when no new notes are supplied
+    existing_notes = exchange.get("adminNotes")
+
+    if request.adminNotes is None:
+        admin_notes = existing_notes
+    else:
+        admin_notes = request.adminNotes.strip() or None
+
+    # Update exchange request only
+    now = datetime.now(timezone.utc).isoformat()
+
+    update_result = await db["exchange_requests"].update_one(
+        {
+            "_id": exchange["_id"]
+        },
+        {
+            "$set": {
+                "status": new_status,
+                "adminNotes": admin_notes,
+                "updatedAt": now
+            }
+        }
+    )
+
+    if update_result.matched_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Exchange request not found."
+        )
+
+    # Retrieve updated record
+    updated_exchange = await db["exchange_requests"].find_one({
+        "_id": exchange["_id"]
+    })
+
+    return {
+
+        "success": True,
+
+        "message": "Exchange status updated successfully.",
+
+        "requestId": updated_exchange.get("requestId"),
+
+        "status": updated_exchange.get("status"),
+
+        "adminNotes": updated_exchange.get("adminNotes"),
+
+        "updatedAt": updated_exchange.get("updatedAt")
+
+    }
+
+
+
+async def fetch_exchange_shipping_charge(
+    origin_pincode: str,
+    destination_pincode: str,
+    weight: int = 500,
+    pt: str = "Pre-paid"
+):
+    """Fetch Delhivery shipping charge specifically for exchange shipping."""
+
+    origin_pincode = str(origin_pincode).strip()
+    destination_pincode = str(destination_pincode).strip()
+
+    # Validate pincodes
+    if not origin_pincode.isdigit() or len(origin_pincode) != 6:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid origin pincode: {origin_pincode}"
+        )
+
+    if not destination_pincode.isdigit() or len(destination_pincode) != 6:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid destination pincode: {destination_pincode}"
+        )
+
+    if weight <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Shipment weight must be greater than zero."
+        )
+
+    params = {
+        "md": "E",
+        "ss": "Delivered",
+        "d_pin": destination_pincode,
+        "o_pin": origin_pincode,
+        "cgm": weight,
+        "pt": pt
+    }
+
+    headers = {
+        "Authorization": f"Token {DELHIVERY_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    url = f"{DELHIVERY_BASE_URL.rstrip('/')}/api/kinko/v1/invoice/charges/.json"
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+
+            response = await client.get(
+                url,
+                params=params,
+                headers=headers
+            )
+
+        # Log the actual Delhivery response for debugging
+        print("========== DELHIVERY EXCHANGE SHIPPING ==========")
+        print("Origin:", origin_pincode)
+        print("Destination:", destination_pincode)
+        print("Weight:", weight)
+        print("Status Code:", response.status_code)
+        print("Response:", response.text)
+        print("================================================")
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Delhivery shipping charge API failed",
+                    "status_code": response.status_code,
+                    "response": response.text[:1000]
+                }
+            )
+
+        try:
+            data = response.json()
+        except ValueError:
+            raise HTTPException(
+                status_code=502,
+                detail="Delhivery returned an invalid JSON response."
+            )
+
+        # Delhivery may return a list of charge records
+        if isinstance(data, list):
+
+            if not data:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Delhivery returned an empty shipping charge response."
+                )
+
+            charge_data = data[0]
+
+        # Or a dictionary
+        elif isinstance(data, dict):
+
+            charge_data = data
+
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="Unexpected Delhivery shipping charge response."
+            )
+
+        total_amount = charge_data.get("total_amount")
+
+        if total_amount is None:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Delhivery response does not contain total_amount",
+                    "response": data
+                }
+            )
+
+        try:
+            total_amount = float(total_amount)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=502,
+                detail="Invalid shipping charge returned by Delhivery."
+            )
+
+        if total_amount < 0:
+            raise HTTPException(
+                status_code=502,
+                detail="Delhivery returned a negative shipping charge."
+            )
+
+        return total_amount
+
+    except HTTPException:
+        raise
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="Delhivery shipping charge request timed out."
+        )
+
+    except httpx.RequestError as e:
+        print("Delhivery request error:", str(e))
+
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to connect to Delhivery shipping charge API."
+        )
+
+    except Exception as e:
+        print("Unexpected Delhivery shipping error:", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unexpected error while calculating exchange shipping."
+        )
+
+
+
+
+
+async def calculate_exchange_shipping(
+    customer_pincode: str,
+    weight: int = 500
+):
+    # Use the SAME normal shipping function
+    shipping_charge = await fetch_shipping_charge(
+        destination_pincode=customer_pincode,
+        weight=weight
+    )
+
+    # Simply double the normal delivery charge
+    total_shipping = round(float(shipping_charge) * 2, 2)
+
+    return {
+        "returnShipping": float(shipping_charge),
+        "replacementShipping": float(shipping_charge),
+        "totalShipping": total_shipping
+    }
+
+
+# ============================================================
+# EXCHANGE: CREATE RAZORPAY PAYMENT
+# ============================================================
+
+
+@app.post("/exchange/create-payment")
+async def create_exchange_payment(request: Request):
+
+    try:
+
+        # ========================================================
+        # 1. READ REQUEST
+        # ========================================================
+
+        data = await request.json()
+
+        request_id = str(
+            data.get("requestId") or ""
+        ).strip()
+
+        if not request_id:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Exchange request ID is required."
+            )
+
+        # ========================================================
+        # 2. FIND EXCHANGE REQUEST
+        # ========================================================
+
+        exchange = await db["exchange_requests"].find_one({
+            "requestId": request_id
+        })
+
+        if not exchange:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Exchange request not found."
+            )
+
+        items = exchange.get("items") or []
+
+        if not isinstance(items, list) or not items:
+
+            raise HTTPException(
+                status_code=400,
+                detail="No exchange items found."
+            )
+
+        # ========================================================
+        # 3. IDENTIFY SIZE EXCHANGE ITEMS
+        # ========================================================
+
+        size_items = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and item.get("reason") == "size_issue"
+        ]
+
+        if not size_items:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Payment is required only for size exchanges."
+            )
+
+        size_exchange_count = len(size_items)
+
+        # ========================================================
+        # 4. VALIDATE EXCHANGE STATUS
+        # ========================================================
+
+        if exchange.get("status") != "Payment Pending":
+
+            raise HTTPException(
+                status_code=409,
+                detail="This exchange is not awaiting payment."
+            )
+
+        if exchange.get("paymentStatus") == "Paid":
+
+            raise HTTPException(
+                status_code=409,
+                detail="Payment has already been completed."
+            )
+
+        # ========================================================
+        # 5. FIND ORIGINAL ORDER
+        # ========================================================
+
+        order_id = exchange.get("order_id")
+
+        if not order_id:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Original order ID is missing."
+            )
+
+        order = await db["orders"].find_one({
+            "orderId": order_id
+        })
+
+        if not order:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Original order not found."
+            )
+
+        # ========================================================
+        # 6. GET ORIGINAL ORDER ADDRESS
+        # ========================================================
+
+        checkout_data = order.get("checkoutData") or {}
+
+        if not isinstance(checkout_data, dict):
+
+            checkout_data = {}
+
+        # ========================================================
+        # 7. GET EXCHANGE DELIVERY ADDRESS
+        #
+        # New exchange requests:
+        #     Use exchangeAddress.
+        #
+        # Older exchange requests:
+        #     Fall back to original checkoutData.
+        # ========================================================
+
+        exchange_address = exchange.get(
+            "exchangeAddress"
+        ) or {}
+
+        if not isinstance(exchange_address, dict):
+
+            exchange_address = {}
+
+        # ========================================================
+        # 8. DETERMINE DELIVERY PINCODE
+        #
+        # Priority:
+        #     1. Exchange delivery address
+        #     2. Original order delivery address
+        # ========================================================
+
+        customer_pincode = str(
+            exchange_address.get("pincode")
+            or checkout_data.get("pincode")
+            or ""
+        ).strip()
+
+        if not customer_pincode:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Exchange delivery pincode is missing."
+            )
+
+        # ========================================================
+        # 9. GET NORMAL DELHIVERY SHIPPING CHARGE
+        # ========================================================
+
+        print("[EXCHANGE PAYMENT] Calling Delhivery shipping API")
+
+        shipping_response = await get_shipping_charge(
+            d_pin=customer_pincode,
+            weight=500,
+            pt="Pre-paid"
+        )
+
+        print("[EXCHANGE PAYMENT] Delhivery response:", shipping_response)
+
+        if not isinstance(shipping_response, dict):
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid shipping calculation response."
+            )
+
+        try:
+
+            normal_shipping = float(
+                shipping_response.get("total_amount", 0)
+            )
+
+        except (TypeError, ValueError):
+
+            normal_shipping = 0
+
+        if normal_shipping <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Unable to calculate normal shipping."
+            )
+
+        print(
+    "[EXCHANGE SHIPPING DEBUG]",
+    {
+        "size_exchange_count": size_exchange_count,
+        "normal_shipping": normal_shipping,
+        "items": items
+    }
+)
+
+        # ========================================================
+        # 10. APPLY EXCHANGE SHIPPING CALCULATION
+        #
+        # 1 size exchange:
+        #     Normal shipping x 2
+        #
+        # 2 or more size exchanges:
+        #     Normal shipping x 3
+        #
+        # Defective-only exchanges:
+        #     No payment required.
+        # ========================================================
+
+        if size_exchange_count == 1:
+
+            shipping_multiplier = 2
+
+        elif size_exchange_count >= 2:
+
+            shipping_multiplier = 3
+
+        else:
+
+    # No size exchange — defective-only exchange
+            raise HTTPException(
+                status_code=400,
+                detail="No shipping payment required for defective-only exchange."
+            )
+
+        base_shipping = normal_shipping * shipping_multiplier
+
+# Additional ₹40 per size-exchange product
+        exchange_charge = size_exchange_count * 40 
+
+        total_shipping = round(
+             base_shipping + exchange_charge,
+            2
+        )
+
+        amount_paise = int(
+            round(total_shipping * 100)
+        )
+
+        if amount_paise <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid exchange payment amount."
+            )
+
+        # ========================================================
+        # 11. LOG PAYMENT CALCULATION
+        # ========================================================
+
+        print(
+            "[EXCHANGE PAYMENT]",
+            {
+                "requestId": request_id,
+                "originalOrderId": order_id,
+                "customerPincode": customer_pincode,
+                "sizeExchangeCount": size_exchange_count,
+                "normalShipping": normal_shipping,
+                "shippingMultiplier": shipping_multiplier,
+                "totalShipping": total_shipping,
+                "amountPaise": amount_paise
+            }
+        )
+
+        # ========================================================
+        # 12. CREATE RAZORPAY ORDER
+        # ========================================================
+
+        print("[EXCHANGE PAYMENT] Calling Razorpay order API")
+
+        razorpay_order = razorpay_client.order.create({
+
+            "amount": amount_paise,
+
+            "currency": "INR",
+
+            "receipt": request_id,
+
+            "notes": {
+
+                "exchangeRequestId": request_id,
+
+                "originalOrderId": str(order_id),
+
+                "paymentType": "Grouped Size Exchange Shipping",
+
+                "sizeExchangeCount": str(
+                    size_exchange_count
+                )
+
+            },
+
+            "payment_capture": 1
+
+        })
+
+        print("[EXCHANGE PAYMENT] Razorpay order created:", razorpay_order.get("id"))
+
+        razorpay_order_id = razorpay_order.get("id")
+
+        if not razorpay_order_id:
+
+            raise HTTPException(
+                status_code=502,
+                detail="Razorpay order creation failed."
+            )
+
+        # ========================================================
+        # 13. SAVE PAYMENT DETAILS
+        # ========================================================
+
+        now = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        update_result = await db[
+            "exchange_requests"
+        ].update_one(
+
+            {
+                "requestId": request_id,
+
+                "status": "Payment Pending",
+
+                "paymentStatus": "Pending"
+
+            },
+
+            {
+                "$set": {
+
+                    "paymentAmount": total_shipping,
+
+                    "normalShipping": normal_shipping,
+
+                    "shippingMultiplier": shipping_multiplier,
+
+                    "sizeExchangeCount": size_exchange_count,
+
+                    "razorpayOrderId": razorpay_order_id,
+
+                    "paymentStatus": "Pending",
+
+                    "updatedAt": now
+
+                }
+            }
+        )
+
+        if update_result.modified_count != 1:
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Exchange payment details could not be saved. "
+                    "Please refresh and try again."
+                )
+            )
+
+        # ========================================================
+        # 14. RETURN PAYMENT DETAILS TO FRONTEND
+        # ========================================================
+
+        return {
+
+            "success": True,
+
+            "requestId": request_id,
+
+            "razorpayOrderId": razorpay_order_id,
+
+            "razorpayKey": RAZORPAY_KEY_ID,
+
+            "amount": amount_paise,
+
+            "currency": "INR",
+
+            "shipping": {
+
+                "normalShipping": normal_shipping,
+
+                "shippingMultiplier": shipping_multiplier,
+
+                "sizeExchangeCount": size_exchange_count,
+
+                "totalShipping": total_shipping
+
+            }
+
+        }
+
+    except HTTPException:
+
+        raise
+
+    except Exception as e:
+
+        import traceback
+
+        print(
+            "[EXCHANGE PAYMENT] Create payment error:",
+            repr(e)
+        )
+
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create exchange payment."
+        )
+
+# ============================================================
+# EXCHANGE: VERIFY RAZORPAY PAYMENT
+# ============================================================
+
+@app.post("/exchange/verify-payment")
+async def verify_exchange_payment(request: Request):
+
+    try:
+
+        data = await request.json()
+
+        request_id = str(
+            data.get("requestId") or ""
+        ).strip()
+
+        razorpay_order_id = str(
+            data.get("razorpay_order_id") or ""
+        ).strip()
+
+        razorpay_payment_id = str(
+            data.get("razorpay_payment_id") or ""
+        ).strip()
+
+        razorpay_signature = str(
+            data.get("razorpay_signature") or ""
+        ).strip()
+
+        # ----------------------------------------------------
+        # 1. Validate input
+        # ----------------------------------------------------
+
+        if not all([
+            request_id,
+            razorpay_order_id,
+            razorpay_payment_id,
+            razorpay_signature
+        ]):
+
+            raise HTTPException(
+                status_code=400,
+                detail="Missing Razorpay payment details."
+            )
+
+        # ----------------------------------------------------
+        # 2. Find grouped exchange
+        # ----------------------------------------------------
+
+        exchange = await db["exchange_requests"].find_one({
+            "requestId": request_id
+        })
+
+        if not exchange:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Exchange request not found."
+            )
+
+        # ----------------------------------------------------
+        # 3. Validate grouped request
+        # ----------------------------------------------------
+
+        items = exchange.get("items") or []
+
+        size_items = [
+            item for item in items
+            if isinstance(item, dict)
+            and item.get("reason") == "size_issue"
+        ]
+
+        if not size_items:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Payment verification is only for size exchanges."
+            )
+
+        if exchange.get("razorpayOrderId") != razorpay_order_id:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Razorpay order does not match this exchange."
+            )
+
+        # ----------------------------------------------------
+        # 4. Verify Razorpay signature
+        # ----------------------------------------------------
+
+        try:
+
+            razorpay_client.utility.verify_payment_signature({
+
+                "razorpay_order_id": razorpay_order_id,
+
+                "razorpay_payment_id": razorpay_payment_id,
+
+                "razorpay_signature": razorpay_signature
+
+            })
+
+        except Exception:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Razorpay payment signature verification failed."
+            )
+
+        # ----------------------------------------------------
+        # 5. Fetch payment
+        # ----------------------------------------------------
+
+        payment = razorpay_client.payment.fetch(
+            razorpay_payment_id
+        )
+
+        if payment.get("order_id") != razorpay_order_id:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Payment belongs to a different Razorpay order."
+            )
+
+        # ----------------------------------------------------
+        # 6. Verify exact amount
+        # ----------------------------------------------------
+
+        expected_amount = int(
+            round(
+                float(exchange.get("paymentAmount", 0)) * 100
+            )
+        )
+
+        if int(payment.get("amount", 0)) != expected_amount:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Payment amount does not match exchange shipping."
+            )
+
+        if payment.get("currency") != "INR":
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid payment currency."
+            )
+
+        if payment.get("status") != "captured":
+
+            raise HTTPException(
+                status_code=400,
+                detail="Payment has not been captured yet."
+            )
+
+        # ----------------------------------------------------
+        # 7. Idempotency
+        # ----------------------------------------------------
+
+        if exchange.get("paymentStatus") == "Paid":
+
+            if exchange.get(
+                "razorpayPaymentId"
+            ) == razorpay_payment_id:
+
+                return {
+
+                    "success": True,
+
+                    "message": "Exchange payment was already verified.",
+
+                    "requestId": request_id,
+
+                    "status": exchange.get("status"),
+
+                    "paymentStatus": "Paid"
+
+                }
+
+            raise HTTPException(
+                status_code=409,
+                detail="A different payment has already been recorded."
+            )
+
+        # ----------------------------------------------------
+        # 8. Approve grouped size exchange
+        #
+        # Defective items remain Pending Review.
+        # ----------------------------------------------------
+
+        if exchange.get("status") != "Payment Pending":
+
+            raise HTTPException(
+                status_code=409,
+                detail="Exchange is not awaiting payment."
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Update only size-exchange item statuses.
+        updated_items = []
+
+        for item in items:
+
+            updated_item = dict(item)
+
+            if updated_item.get("reason") == "size_issue":
+
+                updated_item["status"] = "Approved"
+
+            updated_items.append(updated_item)
+
+        result = await db["exchange_requests"].update_one(
+
+            {
+                "requestId": request_id,
+                "status": "Payment Pending",
+                "paymentStatus": "Pending",
+                "razorpayOrderId": razorpay_order_id
+            },
+
+            {
+                "$set": {
+
+                    "items": updated_items,
+
+                    "status": "Approved",
+
+                    "paymentStatus": "Paid",
+
+                    "razorpayPaymentId": razorpay_payment_id,
+
+                    "razorpaySignature": razorpay_signature,
+
+                    "paymentVerifiedAt": now,
+
+                    "updatedAt": now
+
+                }
+            }
+        )
+
+        # ----------------------------------------------------
+        # 9. Handle concurrent verification
+        # ----------------------------------------------------
+
+        if result.modified_count != 1:
+
+            latest = await db["exchange_requests"].find_one({
+                "requestId": request_id
+            })
+
+            if (
+                latest
+                and latest.get("paymentStatus") == "Paid"
+                and latest.get("razorpayPaymentId")
+                == razorpay_payment_id
+            ):
+
+                return {
+
+                    "success": True,
+
+                    "message": "Exchange payment was already verified.",
+
+                    "requestId": request_id,
+
+                    "status": latest.get("status"),
+
+                    "paymentStatus": "Paid"
+
+                }
+
+            raise HTTPException(
+                status_code=409,
+                detail="Exchange status changed. Please refresh."
+            )
+
+        # ----------------------------------------------------
+        # 10. Return verified result
+        # ----------------------------------------------------
+
+
+        original_order_id = str(
+            exchange.get("originalOrderId")
+            or exchange.get("orderId")
+            or ""
+        ).strip()
+
+        return {
+
+            "success": True,
+
+            "message": "Payment verified. Size exchange approved.",
+
+            "requestId": request_id,
+
+            "originalOrderId": original_order_id,
+
+            "status": "Approved",
+
+            "paymentStatus": "Paid"
+
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        import traceback
+
+        print(
+            "[EXCHANGE PAYMENT] Verification error:",
+            repr(e)
+        )
+
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to verify exchange payment."
+        )
 

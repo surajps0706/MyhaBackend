@@ -72,6 +72,11 @@ class ResetPasswordRequest(BaseModel):
     otp: str
     newPassword: str
 
+
+class ExchangeStatusUpdateRequest(BaseModel):
+    status: str
+    adminNotes: Optional[str] = None
+
 # ----------------- NEW CODE END -----------------
 
 # uvicorn main:app --reload
