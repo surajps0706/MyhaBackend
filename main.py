@@ -1292,54 +1292,97 @@ from fastapi.responses import JSONResponse
 from database import db, get_next_order_id  # ✅ make sure this import exists
 import httpx
 
+
+
 @app.post("/create-order")
 async def create_order(request: Request):
-    """Creates a new Razorpay order and assigns a sequential Myha order ID — without inserting in DB yet."""
     try:
         data = await request.json()
-        amount = data.get("amount")
+
+        amount = float(data.get("amount", 0))
         currency = data.get("currency", "INR")
         notes = data.get("notes", {})
         destination_pincode = data.get("destination_pincode")
 
-        if not amount:
-            return JSONResponse(status_code=400, content={"error": "Amount is required"})
+        if amount <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Amount is required"
+            )
 
-        # ✅ Step 1: Generate next sequential order ID
+        # 1. Generate Myha order ID
         order_id = await get_next_order_id()
 
-        # ✅ Step 2: (Optional) Fetch shipping charge from Delhivery
-        shipping_charge = 0
-        if destination_pincode:
-            try:
-                shipping_charge = await fetch_shipping_charge(destination_pincode)
-            except Exception as e:
-                print(f"⚠️ Failed to fetch shipping charge: {e}")
-                shipping_charge = 0
-
-        # ✅ Step 3: Create Razorpay order (use order_id in receipt for traceability)
+        # 2. Create Razorpay order
         razorpay_order = razorpay_client.order.create({
-            "amount": int(float(amount) * 100),  # Razorpay expects amount in paise
+            "amount": int(round(amount * 100)),
             "currency": currency,
             "receipt": f"MYHA{order_id}",
             "notes": notes,
             "payment_capture": 1
         })
 
-        # ⚠️ Removed DB insert here — we only save after payment success via /save-order
+        # 3. Prepare pending order document
+        now = iso_now()
 
-        # ✅ Step 4: Return response to frontend
+        order_document = {
+            "orderId": order_id,
+            "razorpayOrderId": razorpay_order["id"],
+            "razorpayPaymentId": None,
+
+            "paymentStatus": "Pending",
+            "paymentConfirmed": False,
+
+            "status": "Payment Pending",
+            "createdAt": now,
+            "updatedAt": now,
+
+            "statusTimeline": {
+                "Payment Pending": now
+            },
+
+            "mode": data.get("mode", "guest"),
+            "userId": data.get("userId"),
+
+            "checkoutData": data.get("checkoutData", {}),
+            "cartItems": data.get("cartItems", []),
+
+            "cartTotal": float(data.get("cartTotal", 0)),
+            "shippingCost": float(data.get("shippingCost", 0)),
+            "grandTotal": amount,
+
+            "amountPaise": int(round(amount * 100)),
+            "currency": currency,
+
+            "destination_pincode": destination_pincode,
+            "paymentType": "Prepaid"
+        }
+
+        # 4. Save order BEFORE payment
+        await db["orders"].insert_one(order_document)
+
+        print(f"✅ Pending order saved: {order_id}")
+
+        # 5. Return Razorpay details
         return {
             "success": True,
-            "message": "Order created successfully",
+            "message": "Pending order created",
             "orderId": order_id,
             "razorpay_order": razorpay_order,
-            "shippingCharge": shipping_charge
+            "shippingCharge": data.get("shippingCost", 0)
         }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         print(f"❌ Error creating order: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create order"
+        )
+
 
 # ===================================================
 # Helper: Delhivery Shipping Charge Fetch
