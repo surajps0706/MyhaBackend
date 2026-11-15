@@ -1513,6 +1513,21 @@ async def create_order(request: Request):
     try:
         data = await request.json()
 
+        checkout_data = data.get("checkoutData") or {}
+        cart_items = data.get("cartItems") or []
+
+        if not checkout_data.get("name"):
+            raise HTTPException(400, "Customer name is missing")
+
+        if not checkout_data.get("phone"):
+            raise HTTPException(400, "Customer phone is missing")
+
+        if not checkout_data.get("addressLine1"):
+            raise HTTPException(400, "Customer address is missing")
+
+        if not cart_items:
+            raise HTTPException(400, "Cart items are missing") 
+
         amount = float(data.get("amount", 0))
         currency = data.get("currency", "INR")
         notes = data.get("notes", {})
@@ -1558,8 +1573,8 @@ async def create_order(request: Request):
             "mode": data.get("mode", "guest"),
             "userId": data.get("userId"),
 
-            "checkoutData": data.get("checkoutData", {}),
-            "cartItems": data.get("cartItems", []),
+            "checkoutData": checkout_data,
+            "cartItems": cart_items,
 
             "cartTotal": float(data.get("cartTotal", 0)),
             "shippingCost": float(data.get("shippingCost", 0)),
