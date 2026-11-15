@@ -10,6 +10,9 @@ import asyncio
 from pydantic import BaseModel
 import re
 
+import hmac
+import hashlib
+
 import boto3
 from botocore.client import Config
 
@@ -1267,6 +1270,217 @@ async def upload_product_images(
             detail="Failed to upload images"
         )
 
+
+
+
+
+
+@app.post("/razorpay-webhook")
+async def razorpay_webhook(request: Request):
+
+    # 1. Read raw body
+    body = await request.body()
+
+    signature = request.headers.get(
+        "X-Razorpay-Signature"
+    )
+
+    webhook_secret = os.getenv(
+        "RAZORPAY_WEBHOOK_SECRET"
+    )
+
+    if not signature or not webhook_secret:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing webhook signature or secret"
+        )
+
+    # 2. Verify Razorpay webhook signature
+    expected_signature = hmac.new(
+        webhook_secret.encode("utf-8"),
+        body,
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(
+        expected_signature,
+        signature
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook signature"
+        )
+
+    try:
+
+        event = json.loads(body)
+
+        # 3. Process captured payments only
+        if event.get("event") != "payment.captured":
+            return {"status": "ignored"}
+
+        payment = (
+            event.get("payload", {})
+            .get("payment", {})
+            .get("entity", {})
+        )
+
+        payment_id = payment.get("id")
+        razorpay_order_id = payment.get("order_id")
+
+        if not payment_id or not razorpay_order_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing payment details"
+            )
+
+        if payment.get("status") != "captured":
+            return {"status": "ignored"}
+
+        # 4. Find existing Myha order
+        existing = await db["orders"].find_one({
+            "razorpayOrderId": razorpay_order_id
+        })
+
+        if not existing:
+            print(
+                "⚠️ Pending order not found:",
+                razorpay_order_id
+            )
+
+            # Return 500 so Razorpay retries
+            raise HTTPException(
+                status_code=500,
+                detail="Myha order not found"
+            )
+
+        # 5. Verify payment amount and currency
+        if payment.get("amount") != existing.get("amountPaise"):
+            raise HTTPException(
+                status_code=400,
+                detail="Payment amount mismatch"
+            )
+
+        if payment.get("currency") != existing.get("currency"):
+            raise HTTPException(
+                status_code=400,
+                detail="Payment currency mismatch"
+            )
+
+        # 6. Handle duplicate webhook delivery
+        if existing.get("paymentStatus") == "Paid":
+
+            if existing.get("razorpayPaymentId") == payment_id:
+                return {
+                    "status": "already_processed",
+                    "orderId": existing["orderId"]
+                }
+
+            print(
+                "⚠️ Different payment found for already paid order:",
+                existing["orderId"]
+            )
+
+            return {"status": "payment_conflict"}
+
+        now = iso_now()
+
+        # 7. Update existing order atomically
+        result = await db["orders"].update_one(
+            {
+                "orderId": existing["orderId"],
+                "razorpayOrderId": razorpay_order_id,
+                "paymentStatus": "Pending",
+                "razorpayPaymentId": None
+            },
+            {
+                "$set": {
+                    "razorpayPaymentId": payment_id,
+                    "paymentStatus": "Paid",
+                    "paymentConfirmed": True,
+                    "paymentCapturedAt": now,
+                    "status": "Ordered",
+                    "updatedAt": now,
+                    "statusTimeline.Ordered": now
+                }
+            }
+        )
+
+        if result.modified_count != 1:
+
+            latest = await db["orders"].find_one({
+                "orderId": existing["orderId"]
+            })
+
+            if (
+                latest
+                and latest.get("paymentStatus") == "Paid"
+                and latest.get("razorpayPaymentId") == payment_id
+            ):
+                return {"status": "already_processed"}
+
+            raise HTTPException(
+                status_code=500,
+                detail="Order update failed"
+            )
+
+        print(
+            "✅ Razorpay webhook confirmed order:",
+            existing["orderId"]
+        )
+
+        return {
+            "status": "success",
+            "orderId": existing["orderId"]
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print("❌ Webhook processing error:", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Webhook processing failed"
+        )
+
+
+@app.get("/order-payment-status/{order_id}")
+async def get_order_payment_status(
+    order_id: str,
+    razorpayOrderId: str
+):
+
+    order = await db["orders"].find_one(
+        {
+            "orderId": order_id,
+            "razorpayOrderId": razorpayOrderId
+        },
+        {
+            "_id": 0,
+            "orderId": 1,
+            "paymentStatus": 1,
+            "status": 1,
+            "grandTotal": 1
+        }
+    )
+
+    if not order:
+        raise HTTPException(
+            status_code=404,
+            detail="Order not found"
+        )
+
+    return {
+        "orderId": order.get("orderId"),
+        "paymentStatus": order.get("paymentStatus"),
+        "status": order.get("status"),
+        "grandTotal": order.get("grandTotal")
+    }
+
+
 @app.post("/upload-product")
 async def upload_product(
     name: str = Form(...),
@@ -1428,269 +1642,216 @@ async def fetch_shipping_charge(destination_pincode: str, weight: int = 500, pt:
 # (Normalized cartItems + ISO timestamps)
 # =============================
 from database import db, get_next_order_id  # ✅ ensure this import is at the top
+
 @app.post("/save-order")
 async def save_order(request: Request):
+
     data = await request.json()
 
-    # =========================
-    # 1️⃣ Validate orderId
-    # =========================
     myha_order_id = data.get("orderId")
+    razorpay_order_id = data.get("razorpayOrderId")
+    payment_id = data.get("razorpayPaymentId")
+    razorpay_signature = data.get("razorpaySignature")
 
-    if not myha_order_id:
+    # 1. Validate required fields
+    if not all([
+        myha_order_id,
+        razorpay_order_id,
+        payment_id,
+        razorpay_signature
+    ]):
         raise HTTPException(
             status_code=400,
-            detail="Missing orderId from frontend"
+            detail="Missing payment verification details"
         )
 
-    data["orderId"] = myha_order_id
-    data["razorpayOrderId"] = data.get("razorpayOrderId")
-    data["razorpayPaymentId"] = data.get("razorpayPaymentId")
+    # 2. Verify Razorpay signature
+    key_secret = os.getenv("RAZORPAY_KEY_SECRET")
 
+    if not key_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="Razorpay secret not configured"
+        )
 
-    # =========================
-    # 2️⃣ Status + timestamps
-    # =========================
-    now = iso_now()
+    generated_signature = hmac.new(
+        key_secret.encode("utf-8"),
+        f"{razorpay_order_id}|{payment_id}".encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
 
-    data["status"] = "Ordered"
-    data["createdAt"] = now
-
-    data["statusTimeline"] = {
-        "Ordered": now
-    }
-
-
-    # =========================
-    # 3️⃣ Normalize cart items
-    # =========================
-    normalized_items = []
-
-    for it in data.get("cartItems", []):
-
-        try:
-            price = it.get("price", 0)
-
-            if isinstance(price, str):
-                price = (
-                    price
-                    .replace("₹", "")
-                    .replace(",", "")
-                    .strip()
-                )
-
-            price = float(price or 0)
-
-            qty = int(it.get("quantity", 1))
-
-            sleeve_price = float(
-                it.get("sleevePrice", 0) or 0
-            )
-
-            height_price = float(
-                it.get("extraHeightPrice", 0) or 0
-            )
-
-            bust_price = float(
-                it.get("bustExtra", 0) or 0
-            )
-
-
-            line_total = (
-                price
-                + sleeve_price
-                + height_price
-                + bust_price
-            ) * qty
-
-
-            normalized_items.append({
-                "productId": it.get("productId") or it.get("_id"),
-                "name": it.get("name", "N/A"),
-
-                "image": (
-                    (it.get("images") or [""])[0]
-                    if it.get("images")
-                    else it.get("image", "")
-                ),
-
-                "price": price,
-                "quantity": qty,
-
-                "selectedSize": it.get("selectedSize"),
-
-                "sleeveType": it.get("sleeveType"),
-                "sleevePrice": sleeve_price,
-
-                "preferredHeight": it.get("preferredHeight"),
-                "extraHeightPrice": height_price,
-
-                "neckCustomization": it.get("neckCustomization"),
-
-                "bustExtra": bust_price,
-
-                "lineTotal": line_total,
-
-                "measurements": it.get("measurements", {}),
-
-                "customizationNotes": it.get(
-                    "customizationNotes",
-                    ""
-                )
-            })
-
-
-        except Exception as e:
-            print(
-                "⚠️ Cart item normalization failed:",
-                e
-            )
-
-
-    data["cartItems"] = normalized_items
-
-
-
-    # =========================
-    # 4️⃣ Calculate totals
-    # =========================
-
-    cart_total = sum(
-        item["lineTotal"]
-        for item in normalized_items
-    )
-
-
-    checkout = data.get("checkoutData") or {}
-
-    if isinstance(checkout, list):
-        checkout = checkout[0] if checkout else {}
-
-
-    # IMPORTANT FIX
-    # Use already paid shipping amount
-    # Do NOT call Delhivery again here
-
-    shipping_cost = float(
-        data.get("shippingCost", 0) or 0
-    )
-
-
-    grand_total = cart_total + shipping_cost
-
-
-    data["cartTotal"] = cart_total
-    data["shippingCost"] = shipping_cost
-    data["grandTotal"] = grand_total
-
-
-
-    # =========================
-    # 5️⃣ Save order
-    # =========================
+    if not hmac.compare_digest(
+        generated_signature,
+        razorpay_signature
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Razorpay payment signature"
+        )
 
     try:
 
-        existing = await db["orders"].find_one(
+        # 3. Find existing pending order
+        existing = await db["orders"].find_one({
+            "orderId": myha_order_id,
+            "razorpayOrderId": razorpay_order_id
+        })
+
+        if not existing:
+            raise HTTPException(
+                status_code=404,
+                detail="Order not found"
+            )
+
+        # 4. Handle duplicate confirmation safely
+        if existing.get("paymentStatus") == "Paid":
+
+            if existing.get("razorpayPaymentId") == payment_id:
+                return {
+                    "success": True,
+                    "message": "Order already confirmed",
+                    "orderId": myha_order_id,
+                    "paymentStatus": "Paid",
+                    "grandTotal": existing.get("grandTotal", 0)
+                }
+
+            raise HTTPException(
+                status_code=409,
+                detail="Order already paid with another payment"
+            )
+
+        # 5. Fetch actual payment details from Razorpay
+        payment = razorpay_client.payment.fetch(payment_id)
+
+        if payment.get("order_id") != razorpay_order_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Payment does not match Razorpay order"
+            )
+
+        if payment.get("status") != "captured":
+            raise HTTPException(
+                status_code=400,
+                detail="Payment has not been captured"
+            )
+
+        # 6. Verify amount and currency
+        expected_amount = existing.get("amountPaise")
+        expected_currency = existing.get("currency", "INR")
+
+        if payment.get("amount") != expected_amount:
+            raise HTTPException(
+                status_code=400,
+                detail="Payment amount mismatch"
+            )
+
+        if payment.get("currency") != expected_currency:
+            raise HTTPException(
+                status_code=400,
+                detail="Payment currency mismatch"
+            )
+
+        now = iso_now()
+
+        # 7. Update existing order (never insert another order)
+        result = await db["orders"].update_one(
             {
-                "orderId": myha_order_id
+                "orderId": myha_order_id,
+                "razorpayOrderId": razorpay_order_id,
+                "paymentStatus": "Pending",
+                "razorpayPaymentId": None
+            },
+            {
+                "$set": {
+                    "razorpayPaymentId": payment_id,
+                    "paymentStatus": "Paid",
+                    "paymentConfirmed": True,
+                    "paymentCapturedAt": now,
+                    "status": "Ordered",
+                    "updatedAt": now,
+                    "statusTimeline.Ordered": now
+                }
             }
         )
 
+        # 8. Handle concurrent requests
+        if result.modified_count != 1:
 
-        if existing:
+            latest = await db["orders"].find_one({
+                "orderId": myha_order_id,
+                "razorpayOrderId": razorpay_order_id
+            })
 
-            await db["orders"].update_one(
-                {
-                    "orderId": myha_order_id
-                },
-                {
-                    "$set": data
+            if (
+                latest
+                and latest.get("paymentStatus") == "Paid"
+                and latest.get("razorpayPaymentId") == payment_id
+            ):
+                return {
+                    "success": True,
+                    "message": "Order already confirmed",
+                    "orderId": myha_order_id,
+                    "paymentStatus": "Paid",
+                    "grandTotal": latest.get("grandTotal", 0)
                 }
+
+            raise HTTPException(
+                status_code=409,
+                detail="Order confirmation could not be completed"
             )
 
-            result_id = existing["_id"]
+        # 9. Fetch confirmed order
+        saved_order = await db["orders"].find_one({
+            "orderId": myha_order_id
+        })
 
+        email_data = {
+            k: v for k, v in saved_order.items()
+            if k != "_id"
+        }
 
-        else:
+        # 10. Send confirmation emails
+        checkout = saved_order.get("checkoutData") or {}
 
-            result = await db["orders"].insert_one(
-                data
-            )
+        try:
 
-            result_id = result.inserted_id
+            if checkout.get("email"):
+                send_order_email(
+                    checkout["email"],
+                    email_data,
+                    is_admin=False
+                )
 
+            if ADMIN_EMAIL:
+                send_order_email(
+                    ADMIN_EMAIL,
+                    email_data,
+                    is_admin=True
+                )
 
+        except Exception as email_error:
+            print("Email sending failed:", email_error)
+
+        # 11. Return success
+        return {
+            "success": True,
+            "message": "Order confirmed successfully",
+            "orderId": myha_order_id,
+            "paymentStatus": "Paid",
+            "grandTotal": saved_order.get("grandTotal", 0)
+        }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
 
-        print(
-            "❌ DATABASE SAVE FAILED:",
-            e
-        )
+        print("❌ ORDER CONFIRMATION ERROR:", str(e))
 
         raise HTTPException(
             status_code=500,
-            detail="Order save failed"
+            detail="Order confirmation failed"
         )
-
-
-
-    # =========================
-    # 6️⃣ Emails
-    # =========================
-
-    customer_email = checkout.get("email")
-
-
-    try:
-
-        if customer_email:
-            send_order_email(
-                customer_email,
-                data,
-                is_admin=False
-            )
-
-    except Exception as e:
-        print(
-            "⚠️ Customer email failed:",
-            e
-        )
-
-
-
-    try:
-
-        if ADMIN_EMAIL:
-            send_order_email(
-                ADMIN_EMAIL,
-                data,
-                is_admin=True
-            )
-
-
-    except Exception as e:
-
-        print(
-            "⚠️ Admin email failed:",
-            e
-        )
-
-
-
-    # =========================
-    # 7️⃣ Response
-    # =========================
-
-    return {
-        "message": "Order saved successfully",
-        "orderId": myha_order_id,
-        "id": str(result_id),
-        "cartTotal": cart_total,
-        "shippingCost": shipping_cost,
-        "grandTotal": grand_total
-    }
 
 # =============================
 # Admin: View Orders (projection + sort)
