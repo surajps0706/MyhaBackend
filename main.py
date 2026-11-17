@@ -1853,7 +1853,8 @@ async def save_order(request: Request):
             "message": "Order confirmed successfully",
             "orderId": myha_order_id,
             "paymentStatus": "Paid",
-            "grandTotal": saved_order.get("grandTotal", 0)
+            "grandTotal": saved_order.get("grandTotal", 0),
+            "shippingCost": existing.get("shippingCost", 0)
         }
 
     except HTTPException:
