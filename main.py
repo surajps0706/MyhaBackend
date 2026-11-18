@@ -2385,6 +2385,7 @@ async def save_order(request: Request):
 # =============================
 # Admin: View Orders (projection + sort)
 # =============================
+
 @app.get("/orders")
 async def get_orders(authorization: str = Header(None)):
     if authorization != f"Bearer {ADMIN_TOKEN}":
@@ -2398,7 +2399,14 @@ async def get_orders(authorization: str = Header(None)):
             "status": 1,
             "createdAt": 1,
             "awb": 1,
+
+            # Price fields
+            "grandTotal": 1,
+            "cartTotal": 1,
             "totalAmount": 1,
+            "shippingCost": 1,
+            "handlingCharge": 1,
+
             "checkoutData.name": 1,
             "checkoutData.phone": 1,
         }
@@ -2406,7 +2414,6 @@ async def get_orders(authorization: str = Header(None)):
 
     orders = [o async for o in cursor]
     return orders
-
 
 
 #drag and drop
