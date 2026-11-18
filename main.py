@@ -34,7 +34,7 @@ import uuid
 from fastapi import UploadFile, File, Form, HTTPException
 
 from io import BytesIO
-
+import math 
 import razorpay
 import os
 import smtplib
@@ -1508,54 +1508,504 @@ import httpx
 
 
 
+
 @app.post("/create-order")
 async def create_order(request: Request):
+
     try:
+
         data = await request.json()
 
         checkout_data = data.get("checkoutData") or {}
         cart_items = data.get("cartItems") or []
 
-        if not checkout_data.get("name"):
+        # =====================================================
+        # 1. VALIDATE CUSTOMER DETAILS
+        # =====================================================
+
+        if not isinstance(checkout_data, dict):
+            raise HTTPException(400, "Invalid checkout details")
+
+        name = str(checkout_data.get("name") or "").strip()
+        phone = str(checkout_data.get("phone") or "").strip()
+        email = str(checkout_data.get("email") or "").strip()
+        address = str(checkout_data.get("addressLine1") or "").strip()
+        city = str(checkout_data.get("city") or "").strip()
+        state = str(checkout_data.get("state") or "").strip()
+        pincode = str(checkout_data.get("pincode") or "").strip()
+
+        if not name:
             raise HTTPException(400, "Customer name is missing")
 
-        if not checkout_data.get("phone"):
-            raise HTTPException(400, "Customer phone is missing")
+        if not re.fullmatch(r"[0-9]{10}", phone):
+            raise HTTPException(400, "Invalid 10-digit phone number")
 
-        if not checkout_data.get("addressLine1"):
-            raise HTTPException(400, "Customer address is missing")
+        if not email:
+            raise HTTPException(400, "Customer email is missing")
 
-        if not cart_items:
-            raise HTTPException(400, "Cart items are missing") 
+        if not address or not city or not state:
+            raise HTTPException(400, "Complete delivery address is required")
 
-        amount = float(data.get("amount", 0))
-        currency = data.get("currency", "INR")
-        notes = data.get("notes", {})
-        destination_pincode = data.get("destination_pincode")
+        if not re.fullmatch(r"[0-9]{6}", pincode):
+            raise HTTPException(400, "Invalid delivery pincode")
 
-        if amount <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Amount is required"
+        if not isinstance(cart_items, list) or not cart_items:
+            raise HTTPException(400, "Cart items are missing")
+
+        if len(cart_items) > 50:
+            raise HTTPException(400, "Too many cart items")
+
+        # =====================================================
+        # 2. HELPER FOR SAFE NUMERIC VALUES
+        # =====================================================
+
+        def safe_number(value, field_name):
+
+            try:
+                number = float(value)
+
+                if not math.isfinite(number):
+                    raise ValueError()
+
+                return number
+
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid {field_name}"
+                )
+
+        # =====================================================
+        # 3. FETCH PRODUCTS AND RECALCULATE CART
+        # =====================================================
+
+        verified_cart = []
+        cart_total = 0.0
+        total_quantity = 0
+
+        for item in cart_items:
+
+            if not isinstance(item, dict):
+                raise HTTPException(400, "Invalid cart item")
+
+            product_id = str(
+                item.get("id") or item.get("_id") or ""
+            ).strip()
+
+            if not ObjectId.is_valid(product_id):
+                raise HTTPException(
+                    400,
+                    detail="Invalid product ID in cart"
+                )
+
+            product = await db["products"].find_one({
+                "_id": ObjectId(product_id)
+            })
+
+            if not product:
+                raise HTTPException(
+                    404,
+                    detail="A product in your cart no longer exists"
+                )
+
+            # ---------------------------------------------
+            # Check product availability
+            # ---------------------------------------------
+
+            if product.get("isSoldOut") is True:
+
+                raise HTTPException(
+                    400,
+                    detail=f"{product.get('name', 'Product')} is sold out"
+                )
+
+            quantity = item.get("quantity", 1)
+
+            if isinstance(quantity, bool):
+                raise HTTPException(400, "Invalid product quantity")
+
+            try:
+                quantity = int(quantity)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "Invalid product quantity")
+
+            if quantity < 1 or quantity > 20:
+                raise HTTPException(
+                    400,
+                    detail="Invalid product quantity"
+                )
+
+            stock = product.get("stock")
+
+            if stock is not None:
+
+                available_stock = safe_number(stock, "product stock")
+
+                if available_stock <= 0 or quantity > available_stock:
+
+                    raise HTTPException(
+                        400,
+                        detail=f"Insufficient stock for {product.get('name', 'product')}"
+                    )
+
+            # ---------------------------------------------
+            # Validate selected size
+            # ---------------------------------------------
+
+            selected_size = item.get("selectedSize")
+
+            if isinstance(selected_size, dict):
+                selected_size = selected_size.get("label")
+
+            if selected_size:
+
+                product_sizes = product.get("sizes") or []
+
+                if product_sizes:
+
+                    matching_size = None
+
+                    for size in product_sizes:
+
+                        if isinstance(size, dict):
+                            size_label = size.get("label")
+                            size_available = size.get("available", True)
+
+                        else:
+                            size_label = size
+                            size_available = True
+
+                        if str(size_label).strip().lower() == str(
+                            selected_size
+                        ).strip().lower():
+
+                            matching_size = size_available
+                            break
+
+                    if matching_size is None:
+                        raise HTTPException(
+                            400,
+                            detail=f"Selected size {selected_size} is unavailable"
+                        )
+
+                    if matching_size is False:
+                        raise HTTPException(
+                            400,
+                            detail=f"Size {selected_size} is currently unavailable"
+                        )
+
+            # ---------------------------------------------
+            # Get current MongoDB product price
+            # ---------------------------------------------
+
+            base_price = safe_number(
+                product.get("price"),
+                "product price"
             )
 
-        # 1. Generate Myha order ID
+            if base_price < 0:
+                raise HTTPException(400, "Invalid product price")
+
+            # ---------------------------------------------
+            # Sleeve customization
+            # ---------------------------------------------
+
+            sleeve_type = item.get("sleeveType")
+            sleeve_price = 0.0
+
+            fabric_price = safe_number(
+                product.get("fabricBasePrice", 0),
+                "fabric price"
+            )
+
+            if sleeve_type:
+
+                if (
+                    product.get("enableFabricPrice") is True
+                    and fabric_price > 0
+                ):
+
+                    sleeve_prices = {
+                        "Small Sleeve": 0,
+                        "Small Sleeves": 0,
+                        "Half Sleeve": round(fabric_price / 2),
+                        "3/4 Sleeve": round(fabric_price * 0.75),
+                        "Full Sleeve": fabric_price
+                    }
+
+                else:
+
+                    sleeve_prices = {
+                        "Small Sleeve": 0,
+                        "Small Sleeves": 0,
+                        "Elbow Sleeves": 50,
+                        "3/4 Sleeves": 70,
+                        "3/4 Sleeve": 70,
+                        "Full Sleeve": 100
+                    }
+
+                if sleeve_type not in sleeve_prices:
+                    raise HTTPException(
+                        400,
+                        detail="Invalid sleeve selection"
+                    )
+
+                sleeve_price = sleeve_prices[sleeve_type]
+
+            # ---------------------------------------------
+            # Height customization
+            # ---------------------------------------------
+
+            preferred_height = safe_number(
+                item.get("preferredHeight") or 0,
+                "preferred height"
+            )
+
+            height_price = 0
+
+            if (
+                item.get("hasHeightCustomization") is True
+                and product.get("enableHeightCustomization") is True
+                and str(product.get("category", "")).lower() == "kurti"
+                and preferred_height > 35
+            ):
+                height_price = 150
+
+            # ---------------------------------------------
+            # Bust customization
+            # ---------------------------------------------
+
+            measurements = item.get("measurements") or {}
+
+            if not isinstance(measurements, dict):
+                raise HTTPException(400, "Invalid measurements")
+
+            bust = safe_number(
+                measurements.get("bust") or 0,
+                "bust measurement"
+            )
+
+            bust_price = 150 if bust >= 45 else 0
+
+            # ---------------------------------------------
+            # Built-in pads
+            # ---------------------------------------------
+
+            built_in_pads = (
+                item.get("hasBuiltInPads") is True
+                and product.get("enableBuiltInPads") is True
+            )
+
+            built_in_pads_price = 200 if built_in_pads else 0
+
+            # ---------------------------------------------
+            # Calculate verified item total
+            # ---------------------------------------------
+
+            unit_price = (
+                base_price
+                + sleeve_price
+                + height_price
+                + bust_price
+                + built_in_pads_price
+            )
+
+            item_total = unit_price * quantity
+
+            cart_total += item_total
+            total_quantity += quantity
+
+            # ---------------------------------------------
+            # Save trusted product and pricing details
+            # ---------------------------------------------
+
+            verified_item = {
+                **item,
+
+                "id": str(product["_id"]),
+                "name": product.get("name", ""),
+                "price": base_price,
+
+                "quantity": quantity,
+
+                "selectedSize": selected_size,
+                "measurements": measurements,
+
+                "sleeveType": sleeve_type,
+                "sleevePrice": sleeve_price,
+
+                "preferredHeight": preferred_height,
+                "extraHeightPrice": height_price,
+
+                "bustExtra": bust_price,
+
+                "hasBuiltInPads": built_in_pads,
+                "builtInPadsPrice": built_in_pads_price,
+
+                "isSoldOut": False,
+                "isUnavailable": False
+            }
+
+            verified_cart.append(verified_item)
+
+        # =====================================================
+        # 4. CALCULATE DELHIVERY SHIPPING
+        # =====================================================
+
+        if not DELHIVERY_API_TOKEN:
+            raise HTTPException(
+                500,
+                detail="Shipping service is not configured"
+            )
+
+        origin_pincode = ORIGIN_PINCODE or "603109"
+
+        params = {
+            "md": "S",
+            "ss": "Delivered",
+            "d_pin": pincode,
+            "o_pin": origin_pincode,
+            "cgm": 500,
+            "pt": "Pre-paid"
+        }
+
+        headers = {
+            "Authorization": f"Token {DELHIVERY_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+
+            response = await client.get(
+                f"{DELHIVERY_BASE_URL.rstrip('/')}/api/kinko/v1/invoice/charges/.json",
+                params=params,
+                headers=headers
+            )
+
+        if response.status_code != 200:
+
+            print(
+                "Delhivery shipping error:",
+                response.status_code,
+                response.text[:1000]
+            )
+
+            raise HTTPException(
+                502,
+                detail="Unable to calculate delivery charges"
+            )
+
+        shipping_response = response.json()
+
+        if isinstance(shipping_response, list) and shipping_response:
+
+            delivery_charge = safe_number(
+                shipping_response[0].get("total_amount"),
+                "Delhivery shipping charge"
+            )
+
+        elif isinstance(shipping_response, dict):
+
+            delivery_charge = safe_number(
+                shipping_response.get("total_amount"),
+                "Delhivery shipping charge"
+            )
+
+        else:
+
+            raise HTTPException(
+                502,
+                detail="Invalid Delhivery shipping response"
+            )
+
+        if delivery_charge < 0:
+            raise HTTPException(
+                502,
+                detail="Invalid delivery charge"
+            )
+
+        # =====================================================
+        # 5. PRESERVE EXISTING PACKING CHARGE
+        # =====================================================
+
+        packing_charge = 20
+
+        # Delhivery + ₹20 packing
+        shipping_cost = round(
+            delivery_charge + packing_charge,
+            2
+        )
+
+        # =====================================================
+        # 6. PRESERVE EXISTING QUANTITY HANDLING CHARGE
+        # =====================================================
+
+        handling_charge = 20 if total_quantity >= 3 else 0
+
+        # =====================================================
+        # 7. CALCULATE FINAL SERVER-SIDE AMOUNT
+        # =====================================================
+
+        cart_total = round(cart_total, 2)
+
+        grand_total = round(
+            cart_total
+            + shipping_cost
+            + handling_charge,
+            2
+        )
+
+        amount_paise = int(round(grand_total * 100))
+
+        if amount_paise <= 0:
+            raise HTTPException(
+                400,
+                detail="Invalid order amount"
+            )
+
+        # =====================================================
+        # 8. GENERATE MYHA ORDER ID
+        # =====================================================
+
         order_id = await get_next_order_id()
 
-        # 2. Create Razorpay order
+        # =====================================================
+        # 9. CREATE RAZORPAY ORDER
+        # =====================================================
+
         razorpay_order = razorpay_client.order.create({
-            "amount": int(round(amount * 100)),
-            "currency": currency,
+
+            "amount": amount_paise,
+            "currency": "INR",
+
             "receipt": f"MYHA{order_id}",
-            "notes": notes,
+
+            "notes": {
+                "name": name,
+                "phone": phone,
+                "myha_order_id": str(order_id)
+            },
+
             "payment_capture": 1
+
         })
 
-        # 3. Prepare pending order document
+        if not razorpay_order.get("id"):
+            raise HTTPException(
+                502,
+                detail="Razorpay order creation failed"
+            )
+
+        # =====================================================
+        # 10. SAVE VERIFIED PENDING ORDER
+        # =====================================================
+
         now = iso_now()
 
         order_document = {
+
             "orderId": order_id,
+
             "razorpayOrderId": razorpay_order["id"],
             "razorpayPaymentId": None,
 
@@ -1563,6 +2013,7 @@ async def create_order(request: Request):
             "paymentConfirmed": False,
 
             "status": "Payment Pending",
+
             "createdAt": now,
             "updatedAt": now,
 
@@ -1573,45 +2024,96 @@ async def create_order(request: Request):
             "mode": data.get("mode", "guest"),
             "userId": data.get("userId"),
 
-            "checkoutData": checkout_data,
-            "cartItems": cart_items,
+            "checkoutData": {
+                "name": name,
+                "phone": phone,
+                "email": email,
+                "addressLine1": address,
+                "city": city,
+                "state": state,
+                "pincode": pincode
+            },
 
-            "cartTotal": float(data.get("cartTotal", 0)),
-            "shippingCost": float(data.get("shippingCost", 0)),
-            "grandTotal": amount,
+            "cartItems": verified_cart,
 
-            "amountPaise": int(round(amount * 100)),
-            "currency": currency,
+            "cartTotal": cart_total,
 
-            "destination_pincode": destination_pincode,
+            # Includes Delhivery + ₹20 packing
+            "shippingCost": shipping_cost,
+
+            # Separate ₹20 handling charge when quantity >= 3
+            "handlingCharge": handling_charge,
+
+            "grandTotal": grand_total,
+
+            "amountPaise": amount_paise,
+            "currency": "INR",
+
+            "destination_pincode": pincode,
+
             "paymentType": "Prepaid"
+
         }
 
-        # 4. Save order BEFORE payment
         await db["orders"].insert_one(order_document)
 
-        print(f"✅ Pending order saved: {order_id}")
+        print(
+            "✅ Secure pending order created:",
+            {
+                "orderId": order_id,
+                "cartTotal": cart_total,
+                "deliveryCharge": delivery_charge,
+                "packingCharge": packing_charge,
+                "shippingCost": shipping_cost,
+                "handlingCharge": handling_charge,
+                "grandTotal": grand_total,
+                "amountPaise": amount_paise
+            }
+        )
 
-        # 5. Return Razorpay details
+        # =====================================================
+        # 11. RETURN VERIFIED ORDER TOTALS
+        # =====================================================
+
         return {
+
             "success": True,
+
             "message": "Pending order created",
+
             "orderId": order_id,
+
             "razorpay_order": razorpay_order,
-            "shippingCharge": data.get("shippingCost", 0)
+
+            "cartTotal": cart_total,
+
+            "deliveryCharge": delivery_charge,
+
+            "packingCharge": packing_charge,
+
+            "shippingCharge": shipping_cost,
+
+            "handlingCharge": handling_charge,
+
+            "grandTotal": grand_total
+
         }
 
     except HTTPException:
         raise
 
     except Exception as e:
-        print(f"❌ Error creating order: {e}")
+
+        print(
+            "❌ Secure order creation error:",
+            type(e).__name__,
+            str(e)
+        )
 
         raise HTTPException(
             status_code=500,
             detail="Could not create order"
         )
-
 
 # ===================================================
 # Helper: Delhivery Shipping Charge Fetch
@@ -1657,6 +2159,7 @@ async def fetch_shipping_charge(destination_pincode: str, weight: int = 500, pt:
 # (Normalized cartItems + ISO timestamps)
 # =============================
 from database import db, get_next_order_id  # ✅ ensure this import is at the top
+
 
 @app.post("/save-order")
 async def save_order(request: Request):
@@ -1727,7 +2230,8 @@ async def save_order(request: Request):
                     "message": "Order already confirmed",
                     "orderId": myha_order_id,
                     "paymentStatus": "Paid",
-                    "grandTotal": existing.get("grandTotal", 0)
+                    "grandTotal": existing.get("grandTotal", 0),
+                    "shippingCost": existing.get("shippingCost", 0)
                 }
 
             raise HTTPException(
@@ -1807,7 +2311,8 @@ async def save_order(request: Request):
                     "message": "Order already confirmed",
                     "orderId": myha_order_id,
                     "paymentStatus": "Paid",
-                    "grandTotal": latest.get("grandTotal", 0)
+                    "grandTotal": latest.get("grandTotal", 0),
+                    "shippingCost": latest.get("shippingCost", 0)
                 }
 
             raise HTTPException(
@@ -1817,8 +2322,15 @@ async def save_order(request: Request):
 
         # 9. Fetch confirmed order
         saved_order = await db["orders"].find_one({
-            "orderId": myha_order_id
+            "orderId": myha_order_id,
+            "razorpayOrderId": razorpay_order_id
         })
+
+        if not saved_order:
+            raise HTTPException(
+                status_code=500,
+                detail="Payment confirmed but saved order could not be retrieved"
+            )
 
         email_data = {
             k: v for k, v in saved_order.items()
@@ -1828,24 +2340,25 @@ async def save_order(request: Request):
         # 10. Send confirmation emails
         checkout = saved_order.get("checkoutData") or {}
 
-        try:
-
-            if checkout.get("email"):
+        if checkout.get("email"):
+            try:
                 send_order_email(
                     checkout["email"],
                     email_data,
                     is_admin=False
                 )
+            except Exception as email_error:
+                print("Customer email failed:", email_error)
 
-            if ADMIN_EMAIL:
+        if ADMIN_EMAIL:
+            try:
                 send_order_email(
                     ADMIN_EMAIL,
                     email_data,
                     is_admin=True
                 )
-
-        except Exception as email_error:
-            print("Email sending failed:", email_error)
+            except Exception as email_error:
+                print("Admin email failed:", email_error)
 
         # 11. Return success
         return {
@@ -1854,7 +2367,7 @@ async def save_order(request: Request):
             "orderId": myha_order_id,
             "paymentStatus": "Paid",
             "grandTotal": saved_order.get("grandTotal", 0),
-            "shippingCost": existing.get("shippingCost", 0)
+            "shippingCost": saved_order.get("shippingCost", 0)
         }
 
     except HTTPException:
